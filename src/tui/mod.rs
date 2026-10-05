@@ -105,6 +105,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('f') => {
             app.filter = app.filter.next();
+            app.scroll = 0;
         }
         KeyCode::Char(c) if View::from_digit(c).is_some() => {
             app.set_view(View::from_digit(c).unwrap());

@@ -22,6 +22,7 @@ pub struct SandboxRun {
     pub traces_dir: PathBuf,
     pub target_sha256: String,
     pub command: Vec<String>,
+    pub target_exit_code: Option<i32>,
 }
 
 pub fn docker_available() -> bool {
@@ -131,6 +132,7 @@ pub fn run_in_microvm(
     run_dir: &Path,
     guest_rel: &str,
     target_args: &[String],
+    retain_trace_on_error: bool,
 ) -> Result<SandboxRun> {
     if !docker_available() {
         bail!(
@@ -186,15 +188,22 @@ pub fn run_in_microvm(
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn docker micro-VM")?;
+    let mut target_exit_code = None;
 
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
                 let out = child.wait_with_output()?;
-                bail!(
-                    "micro-VM run failed (exit {status}):\n{}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
+                let has_trace = fs::read_dir(&traces)
+                    .map(|entries| entries.flatten().any(|entry| entry.path().is_file()))
+                    .unwrap_or(false);
+                if !retain_trace_on_error || !has_trace {
+                    bail!(
+                        "micro-VM run failed (exit {status}):\n{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                target_exit_code = status.code();
             }
             break;
         }
@@ -218,6 +227,7 @@ pub fn run_in_microvm(
         traces_dir: traces,
         target_sha256: sha,
         command: vec![guest_rel.to_string()],
+        target_exit_code,
     })
 }
 

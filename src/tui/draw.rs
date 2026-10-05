@@ -58,11 +58,15 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     };
     let status = match &app.analysis {
         Analysis::Pending => "tracing",
+        Analysis::Ready(r) if r.analysis_error.is_some() => "analysis error",
+        Analysis::Ready(r) if r.target_exit_code.is_some() => "target exit",
         Analysis::Ready(_) => "live",
         Analysis::Failed(_) => "error",
     };
     let status_color = match &app.analysis {
         Analysis::Pending => shimmer(app.opened.elapsed().as_secs_f32()),
+        Analysis::Ready(r) if r.analysis_error.is_some() => ROSE,
+        Analysis::Ready(r) if r.target_exit_code.is_some() => PEACH,
         Analysis::Ready(_) => GREEN,
         Analysis::Failed(_) => ROSE,
     };
@@ -198,6 +202,15 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled(label, fg(color)),
                 ]));
             }
+            if r.analysis_error.is_some() {
+                lines.push(Line::from(Span::styled("  analysis failed", fg(ROSE))));
+            }
+            if let Some(code) = r.target_exit_code {
+                lines.push(Line::from(Span::styled(
+                    format!("  target exit {code}"),
+                    fg(PEACH),
+                )));
+            }
         }
         Analysis::Failed(_) => {
             lines.push(Line::from(Span::styled("  failed", fg(ROSE))));
@@ -222,7 +235,10 @@ fn draw_workspace(f: &mut Frame, area: Rect, app: &App) {
     let lines = match &app.analysis {
         Analysis::Pending => pending_doc(app),
         Analysis::Failed(err) => failed_doc(app, err),
-        Analysis::Ready(_) => match app.view {
+        Analysis::Ready(r) => match app.view {
+            View::Overview if r.analysis_error.is_some() => {
+                capture_only_doc(app, r.analysis_error.as_deref().unwrap_or_default())
+            }
             View::Overview => overview_doc(app),
             View::Graph => graph_doc(app),
             View::Events => events_doc(app),
@@ -294,6 +310,35 @@ fn failed_doc(app: &App, err: &str) -> Vec<Line<'static>> {
     lines
 }
 
+fn capture_only_doc(app: &App, err: &str) -> Vec<Line<'static>> {
+    let heading = app.heading_text("capture only", 12);
+    let mut lines = vec![
+        Line::from(Span::styled(format!("  {heading}"), bold(ROSE))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Trace captured, but analysis could not finish.",
+            fg(TEXT),
+        )),
+        Line::from(Span::styled(
+            "  Graph, events, and inspect are available in views 2–4.",
+            fg(TEAL),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  analysis error", bold(PEACH))),
+    ];
+    for part in err.lines() {
+        lines.push(Line::from(Span::styled(format!("  {part}"), fg(TEXT))));
+    }
+    if let Some(code) = app.report().and_then(|r| r.target_exit_code) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  Traced program exited with status {code}."),
+            fg(PEACH),
+        )));
+    }
+    lines
+}
+
 fn overview_doc(app: &App) -> Vec<Line<'static>> {
     let heading = app.heading_text("overview", 10);
     let (label, color, extra) = status(app);
@@ -313,6 +358,13 @@ fn overview_doc(app: &App) -> Vec<Line<'static>> {
             MUTED,
         ),
     ];
+
+    if let Some(code) = app.report().and_then(|r| r.target_exit_code) {
+        lines.push(Line::from(Span::styled(
+            format!("  Traced program exited with status {code}; capture succeeded."),
+            fg(PEACH),
+        )));
+    }
 
     if let Some(start) = app.burst_started {
         let cells = burst_cells(app.burst_seed, start.elapsed().as_secs_f32() / 0.52, 24);
@@ -428,9 +480,22 @@ fn graph_doc(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(format!("  {heading}"), bold(BLUE))),
         Line::from(Span::styled(
-            format!("  filter: {}", app.filter.label()),
+            format!(
+                "  hierarchy  ·  filter: {}  ·  f to cycle",
+                app.filter.label()
+            ),
             fg(DIM),
         )),
+        Line::from(vec![
+            Span::styled("  ● ", bold(BLUE)),
+            Span::styled("file   ", fg(MUTED)),
+            Span::styled("● ", bold(GREEN)),
+            Span::styled("process   ", fg(MUTED)),
+            Span::styled("● ", bold(TEAL)),
+            Span::styled("network   ", fg(MUTED)),
+            Span::styled("● ", bold(ROSE)),
+            Span::styled("risk", fg(ROSE)),
+        ]),
         Line::from(""),
     ];
     match app.graph() {
@@ -516,7 +581,7 @@ fn inspect_doc(app: &App) -> Vec<Line<'static>> {
     let idx = app.cursor.min(g.nodes.len() - 1);
     let node = &g.nodes[idx];
     let label = node_label(node);
-    let color = node_color(&label);
+    let color = graph_node_color(node);
 
     lines.push(fade(
         0,
@@ -675,148 +740,154 @@ fn fade_line(index: usize, app: &App, line: Line<'static>) -> Line<'static> {
 }
 
 fn render_tree_filtered(g: &GraphRecord, filter: &super::app::FilterMode) -> Vec<Line<'static>> {
-    let mut kids: HashMap<&str, Vec<(String, &str)>> = HashMap::new();
-    let mut incoming = HashMap::new();
-    // Build edges but optionally filter nodes/edges based on mode
-    let node_allowed = |id: &str| -> bool {
-        match filter {
+    use std::collections::HashSet;
+
+    let nodes: HashMap<&str, &crate::graph::GraphNode> =
+        g.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let visible: HashSet<&str> = g
+        .nodes
+        .iter()
+        .filter(|n| match filter {
             super::app::FilterMode::All => true,
-            super::app::FilterMode::NetOnly => g
-                .nodes
-                .iter()
-                .find(|n| n.id == id)
-                .map(|n| {
-                    n.label_fields
-                        .get("family")
-                        .map(|s| s == "network")
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false),
-            super::app::FilterMode::FileOnly => g
-                .nodes
-                .iter()
-                .find(|n| n.id == id)
-                .map(|n| {
-                    n.label_fields
-                        .get("family")
-                        .map(|s| s == "file")
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false),
-            super::app::FilterMode::HotOnly => g
-                .nodes
-                .iter()
-                .find(|n| n.id == id)
-                .map(|n| {
-                    let lab = node_label(n);
-                    lab.contains("DECOY")
-                        || lab.contains("SHELL")
-                        || lab.contains("SYSTEM_CONFIG")
-                        || lab.contains("NET_SEND")
-                })
-                .unwrap_or(false),
-        }
-    };
-
-    for e in &g.edges {
-        if !node_allowed(e.src.as_str()) && !node_allowed(e.dst.as_str()) {
-            continue;
-        }
-        kids.entry(e.src.as_str())
-            .or_default()
-            .push((e.edge_type.clone(), e.dst.as_str()));
-        *incoming.entry(e.dst.as_str()).or_insert(0u32) += 1;
-    }
-    let mut roots: Vec<&str> = g
-        .nodes
-        .iter()
+            super::app::FilterMode::NetOnly => {
+                n.label_fields.get("family").is_some_and(|v| v == "network")
+                    || n.label_fields
+                        .get("resource_kind")
+                        .is_some_and(|v| v == "SOCKET")
+            }
+            super::app::FilterMode::FileOnly => {
+                n.label_fields.get("family").is_some_and(|v| v == "file")
+                    || n.label_fields
+                        .get("resource_kind")
+                        .is_some_and(|v| v == "FILE")
+            }
+            super::app::FilterMode::HotOnly => is_risk_node(n),
+        })
         .map(|n| n.id.as_str())
-        .filter(|id| incoming.get(*id).copied().unwrap_or(0) == 0 && node_allowed(id))
         .collect();
-    if roots.is_empty() {
-        roots = g
-            .nodes
-            .iter()
-            .filter(|n| node_allowed(n.id.as_str()))
-            .map(|n| n.id.as_str())
-            .take(1)
-            .collect();
+    if visible.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  no nodes match this filter",
+            fg(MUTED),
+        ))];
     }
-    let labels: HashMap<&str, String> = g
+
+    let mut kids: HashMap<&str, Vec<&crate::graph::GraphEdge>> = HashMap::new();
+    let mut incoming: HashMap<&str, usize> = HashMap::new();
+    for edge in &g.edges {
+        if visible.contains(edge.src.as_str()) && visible.contains(edge.dst.as_str()) {
+            kids.entry(edge.src.as_str()).or_default().push(edge);
+            *incoming.entry(edge.dst.as_str()).or_default() += 1;
+        }
+    }
+    for edges in kids.values_mut() {
+        edges.sort_by(|a, b| (&a.dst, &a.edge_type).cmp(&(&b.dst, &b.edge_type)));
+    }
+
+    // Use the same longest-path hierarchy as the browser viewer. Vertical
+    // sections fit a terminal without cutting off deep chains horizontally.
+    let mut remaining: HashMap<&str, usize> = visible
+        .iter()
+        .map(|id| (*id, incoming.get(id).copied().unwrap_or(0)))
+        .collect();
+    let mut levels: HashMap<&str, usize> = HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    for node in &g.nodes {
+        let id = node.id.as_str();
+        if visible.contains(id) && remaining.get(id) == Some(&0) {
+            levels.insert(id, 0);
+            queue.push_back(id);
+        }
+    }
+    while let Some(id) = queue.pop_front() {
+        let next = levels.get(id).copied().unwrap_or(0) + 1;
+        if let Some(edges) = kids.get(id) {
+            for edge in edges {
+                let dst = edge.dst.as_str();
+                levels
+                    .entry(dst)
+                    .and_modify(|level| *level = (*level).max(next))
+                    .or_insert(next);
+                if let Some(count) = remaining.get_mut(dst) {
+                    *count -= 1;
+                    if *count == 0 {
+                        queue.push_back(dst);
+                    }
+                }
+            }
+        }
+    }
+    let mut fallback = levels.values().copied().max().unwrap_or(0) + 1;
+    for node in &g.nodes {
+        if visible.contains(node.id.as_str()) && !levels.contains_key(node.id.as_str()) {
+            levels.insert(node.id.as_str(), fallback);
+            fallback += 1;
+        }
+    }
+
+    let mut ordered: Vec<_> = g
         .nodes
         .iter()
-        .map(|n| (n.id.as_str(), node_label(n)))
+        .filter(|n| visible.contains(n.id.as_str()))
         .collect();
-
+    ordered.sort_by_key(|n| levels.get(n.id.as_str()).copied().unwrap_or(0));
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for root in roots {
-        walk(root, "", true, &kids, &labels, &mut seen, &mut out);
-    }
-    if out.is_empty() {
-        for n in &g.nodes {
-            let lab = labels.get(n.id.as_str()).cloned().unwrap_or_default();
-            out.push(node_line(&n.id, &lab, "  "));
+    let mut shown_level = None;
+    for node in ordered {
+        let level = levels[&node.id.as_str()];
+        if shown_level != Some(level) {
+            if !out.is_empty() {
+                out.push(Line::from(""));
+            }
+            out.push(Line::from(Span::styled(
+                format!("  layer {level}"),
+                bold(DIM),
+            )));
+            shown_level = Some(level);
+        }
+        out.push(graph_node_line(node, "  "));
+        if let Some(edges) = kids.get(node.id.as_str()) {
+            for (index, edge) in edges.iter().enumerate() {
+                let color = graph_edge_color(&edge.edge_type);
+                let branch = if index + 1 == edges.len() {
+                    "└"
+                } else {
+                    "├"
+                };
+                out.push(Line::from(vec![
+                    Span::styled(format!("    {branch}─"), fg(DIM)),
+                    Span::styled(
+                        format!(" {} ", edge.edge_type.replace('_', " ").to_lowercase()),
+                        fg(color),
+                    ),
+                    Span::styled("──▶ ", fg(color)),
+                    Span::styled(edge.dst.clone(), fg(MUTED)),
+                    Span::styled(
+                        nodes
+                            .get(edge.dst.as_str())
+                            .map(|n| format!("  {}", node_label(n)))
+                            .unwrap_or_default(),
+                        fg(color),
+                    ),
+                ]));
+            }
         }
     }
     out
 }
 
-fn walk(
-    id: &str,
-    prefix: &str,
-    last: bool,
-    kids: &HashMap<&str, Vec<(String, &str)>>,
-    labels: &HashMap<&str, String>,
-    seen: &mut std::collections::HashSet<String>,
-    out: &mut Vec<Line<'static>>,
-) {
-    if !seen.insert(id.to_string()) {
-        return;
-    }
-    let branch = if prefix.is_empty() {
-        "  "
-    } else if last {
-        "└─"
-    } else {
-        "├─"
-    };
-    let lab = labels.get(id).cloned().unwrap_or_else(|| id.to_string());
-    let line_prefix = if prefix.is_empty() {
-        "  ".to_string()
-    } else {
-        format!("{prefix}{branch} ")
-    };
-    out.push(node_line(id, &lab, &line_prefix));
-
-    let children = kids.get(id).cloned().unwrap_or_default();
-    let n = children.len();
-    let next_prefix = if prefix.is_empty() {
-        "  ".to_string()
-    } else if last {
-        format!("{prefix}   ")
-    } else {
-        format!("{prefix}│  ")
-    };
-    for (i, (etype, dst)) in children.into_iter().enumerate() {
-        let is_last = i + 1 == n;
-        let elbow = if is_last { "└─" } else { "├─" };
-        let hot = etype == "BUFFER_FLOW";
-        out.push(Line::from(Span::styled(
-            format!("{next_prefix}{elbow} {etype}"),
-            fg(if hot { ROSE } else { DIM }),
-        )));
-        let child_prefix = format!("{next_prefix}{}", if is_last { "   " } else { "│  " });
-        walk(dst, &child_prefix, true, kids, labels, seen, out);
-    }
-}
-
-fn node_line(id: &str, lab: &str, prefix: &str) -> Line<'static> {
-    Line::from(vec![
+fn graph_node_line(n: &crate::graph::GraphNode, prefix: &str) -> Line<'static> {
+    let color = graph_node_color(n);
+    let mut spans = vec![
         Span::styled(prefix.to_string(), fg(DIM)),
-        Span::styled(format!("{id}  "), fg(DIM)),
-        Span::styled(lab.to_string(), fg(node_color(lab))),
-    ])
+        Span::styled("● ", bold(color)),
+        Span::styled(format!("{}  ", n.id), fg(MUTED)),
+        Span::styled(node_label(n), bold(color)),
+    ];
+    if is_risk_node(n) {
+        spans.push(Span::styled("  ! risk", bold(ROSE)));
+    }
+    Line::from(spans)
 }
 
 fn node_label(n: &crate::graph::GraphNode) -> String {
@@ -833,20 +904,54 @@ fn node_label(n: &crate::graph::GraphNode) -> String {
     }
 }
 
-fn node_color(lab: &str) -> Color {
-    if lab.contains("DECOY")
-        || lab.contains("SHELL")
-        || lab.contains("SYSTEM_CONFIG")
-        || lab.contains("NET_SEND")
-        || lab.contains("NET_SOCKET")
-    {
-        ROSE
-    } else if lab.contains("APP_ROOT") {
-        GREEN
-    } else if lab.starts_with("EXTERNAL") || lab.contains("anchor") {
+fn is_risk_node(n: &crate::graph::GraphNode) -> bool {
+    if n.kind == "anchor" {
+        return false;
+    }
+    let label = node_label(n);
+    let op = n.label_fields.get("op").map(String::as_str).unwrap_or("");
+    let flags = n
+        .label_fields
+        .get("flags")
+        .map(String::as_str)
+        .unwrap_or("");
+    ["DECOY", "SHELL", "SYSTEM_CONFIG", "NET_SEND", "NET_SOCKET"]
+        .iter()
+        .any(|term| label.contains(term))
+        || op == "SHELL_EXEC"
+        || (op == "FILE_WRITE" && flags == "CREATE_WRITE")
+}
+
+fn graph_node_color(n: &crate::graph::GraphNode) -> Color {
+    if n.kind == "anchor" {
         MUTED
+    } else if is_risk_node(n) {
+        ROSE
+    } else if n
+        .label_fields
+        .get("path_class")
+        .is_some_and(|v| v == "APP_ROOT")
+    {
+        GREEN
     } else {
-        TEXT
+        match n.label_fields.get("resource_kind").map(String::as_str) {
+            Some("SOCKET") => TEAL,
+            Some("PROCESS") => GREEN,
+            Some("PIPE" | "MEMORY") => LAVENDER,
+            Some("FILE") => BLUE,
+            _ => TEXT,
+        }
+    }
+}
+
+fn graph_edge_color(edge_type: &str) -> Color {
+    match edge_type {
+        "BUFFER_FLOW" => ROSE,
+        "FD_FLOW" => BLUE,
+        "PROCESS_FLOW" | "PROC_SPAWN" => GREEN,
+        "PIPE_FLOW" => LAVENDER,
+        "SCM_RIGHTS" => TEAL,
+        _ => MUTED,
     }
 }
 

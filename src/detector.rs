@@ -442,12 +442,18 @@ pub fn save_baseline(dir: &Path, manifest: &BaselineManifest) -> Result<PathBuf>
 
 pub fn load_baseline(path: &Path) -> Result<BaselineManifest> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let m: BaselineManifest = serde_json::from_str(&text)?;
-    let expect = checksum_manifest(&m);
-    if m.artifact_checksum != expect {
+    let mut value: serde_json::Value = serde_json::from_str(&text)?;
+    let stored = value
+        .get("artifact_checksum")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("baseline is missing an artifact checksum"))?
+        .to_string();
+    value["artifact_checksum"] = serde_json::Value::String(String::new());
+    let expect = digest(&crate::config::json_to_canon(&value));
+    if stored != expect {
         bail!("baseline checksum mismatch; file may be corrupted");
     }
-    Ok(m)
+    Ok(serde_json::from_str(&text)?)
 }
 
 pub fn find_baseline(dir: &Path, target_sha: &str) -> Option<PathBuf> {

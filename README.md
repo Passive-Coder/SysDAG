@@ -97,6 +97,13 @@ sysdag explain --baseline .sysdag/baselines/<name>.json \
 Artifacts are written below `.sysdag/`: baselines, manifests, event streams,
 graphs, decisions, and private path maps when redaction is enabled.
 
+## Terminal graph
+
+Press `2` in the TUI to see the dependency graph grouped by hierarchy level.
+Nodes use the browser viewer's file, process, network, and risk colors; typed
+arrows show every visible relationship, with buffer-flow risk edges in red.
+Press `f` to cycle graph filters and `j`/`k` to scroll.
+
 ## Browser graph visualizer
 
 When you run `sysdag` in TUI mode and select a graph window, pressing `b` (or

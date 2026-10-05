@@ -504,7 +504,10 @@ fn dispatch(
         target_args,
         true,
         identity,
-        sysdag::pipeline::AnalyzeOpts { allow_mismatch },
+        sysdag::pipeline::AnalyzeOpts {
+            allow_mismatch,
+            ..Default::default()
+        },
     )?;
     print_report(&report, json)
 }
