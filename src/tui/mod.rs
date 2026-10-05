@@ -16,6 +16,7 @@ mod app;
 #[cfg(target_os = "linux")]
 mod browser;
 mod draw;
+mod graph_view;
 mod landing;
 mod motion;
 mod theme;

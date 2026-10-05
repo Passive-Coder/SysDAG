@@ -215,6 +215,10 @@ fn chip(k: &str, v: String) -> Line<'static> {
 }
 
 fn draw_workspace(f: &mut Frame, area: Rect, app: &App) {
+    if app.view == View::Graph && matches!(app.analysis, Analysis::Ready(_)) {
+        super::graph_view::draw(f, area, app);
+        return;
+    }
     let lines = match &app.analysis {
         Analysis::Pending => pending_doc(app),
         Analysis::Failed(err) => failed_doc(app, err),
