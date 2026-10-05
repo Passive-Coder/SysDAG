@@ -14,7 +14,7 @@ use crate::event::TraceEvent;
 /// the kernel reports dropped ring-buffer records, so loss reaches the existing
 /// DEGRADED_CAPTURE decision rule instead of silently biasing a score.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum EbpfEnvelope {
     Event { event: TraceEvent },
@@ -54,6 +54,17 @@ pub fn linux_ebpf_available() -> Result<()> {
     {
         bail!("eBPF is only supported on Linux");
     }
+}
+
+/// The version-2 collector must not be enabled until its kernel-side identity,
+/// descriptor state, and checkpoint ordering have been verified on Linux x86_64.
+/// This is deliberately independent of the working version-1 capability check.
+pub fn loss_certification_available() -> Result<()> {
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    bail!("UNAVAILABLE(target_kernel_not_verified): loss certification requires a verified native Linux x86_64 kernel");
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    bail!("UNAVAILABLE(version_2_collector_not_verified): kernel state and checkpoint ordering have not been validated");
 }
 
 #[cfg(test)]
@@ -97,10 +108,19 @@ mod tests {
             CaptureInfo::default(),
         );
         let raw = serde_json::to_string(&EbpfEnvelope::Event { event }).unwrap();
+        let mut version_two: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        version_two["proof"] = serde_json::json!({"fd": 3});
+        assert!(EbpfEnvelope::parse_jsonl(&version_two.to_string()).is_err());
         let EbpfEnvelope::Event { event } = EbpfEnvelope::parse_jsonl(&raw).unwrap() else {
             panic!("expected event")
         };
         assert_eq!(event.capture.source, "ebpf");
         assert!(EbpfEnvelope::parse_jsonl(r#"{"kind":"lost","count":0}"#).is_err());
+    }
+
+    #[test]
+    fn native_loss_certification_fails_closed() {
+        let error = loss_certification_available().unwrap_err().to_string();
+        assert!(error.starts_with("UNAVAILABLE("));
     }
 }

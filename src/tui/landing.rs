@@ -1,7 +1,7 @@
 //! Full-screen landing: decrypting wordmark, particle rain, TachyonFX spectacle.
 
-use std::io::{self, stdout};
 use std::collections::VecDeque;
+use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -292,7 +292,12 @@ fn path_suggestions(input: &str) -> Vec<String> {
             };
             let is_dir = entry.path().is_dir();
             let suffix = if is_dir { "/" } else { "" };
-            matches.push((0_u8, quality, kind_rank(&entry.path(), is_dir), format!("{prefix}{name}{suffix}")));
+            matches.push((
+                0_u8,
+                quality,
+                kind_rank(&entry.path(), is_dir),
+                format!("{prefix}{name}{suffix}"),
+            ));
         }
     }
 
@@ -324,7 +329,11 @@ fn path_suggestions(input: &str) -> Vec<String> {
                     queue.push_back((path, depth + 1));
                 } else if depth > 0 {
                     if let Some(quality) = match_quality(&name, name_prefix) {
-                        let shown = path.strip_prefix(".").unwrap_or(&path).display().to_string();
+                        let shown = path
+                            .strip_prefix(".")
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string();
                         matches.push((1, quality, kind_rank(&path, false), shown));
                     }
                 }
@@ -333,7 +342,11 @@ fn path_suggestions(input: &str) -> Vec<String> {
     }
 
     matches.sort_by(|a, b| (a.1, a.2, a.0, a.3.len(), &a.3).cmp(&(b.1, b.2, b.0, b.3.len(), &b.3)));
-    matches.into_iter().take(MAX_SUGGESTIONS).map(|(_, _, _, path)| path).collect()
+    matches
+        .into_iter()
+        .take(MAX_SUGGESTIONS)
+        .map(|(_, _, _, path)| path)
+        .collect()
 }
 
 fn ignored_entry(name: &str, query: &str) -> bool {
@@ -363,7 +376,12 @@ fn match_quality(name: &str, query: &str) -> Option<u8> {
 }
 
 fn kind_rank(path: &Path, is_dir: bool) -> u8 {
-    if !is_dir && matches!(path.extension().and_then(|ext| ext.to_str()), Some("c" | "py" | "sh" | "strace")) {
+    if !is_dir
+        && matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("c" | "py" | "sh" | "strace")
+        )
+    {
         0
     } else if is_dir {
         1
@@ -754,7 +772,10 @@ fn draw_suggestions(f: &mut Frame, area: Rect, app: &Landing) {
         fg(DIM),
     ))];
     if app.suggestions.is_empty() {
-        lines.push(Line::from(Span::styled("    no matching paths here", fg(MUTED))));
+        lines.push(Line::from(Span::styled(
+            "    no matching paths here",
+            fg(MUTED),
+        )));
     }
     for (index, suggestion) in app.suggestions.iter().enumerate() {
         let selected = index == app.selected_suggestion;

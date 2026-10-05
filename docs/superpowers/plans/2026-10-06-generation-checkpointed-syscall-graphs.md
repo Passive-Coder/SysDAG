@@ -148,3 +148,7 @@ Keep the existing `event` and `lost` JSONL envelopes unchanged. Add version-2 en
 Tasks 1–3 establish a testable proof model without kernel privileges. Task 4 is the decisive feasibility gate: if kernel identity or state reliability is unavailable, stop rather than represent a simulation as a deployed guarantee. Tasks 5–7 integrate the mechanism behind an explicit opt-in. Task 8 produces the evidence needed for a technical disclosure. A course demonstration may use synthetic fault injection, but the patent disclosure must clearly distinguish that demonstration from verified native Linux behavior.
 
 No patentability or performance claim follows automatically from implementing this plan. Before filing, have the final mechanism and any earlier public disclosure reviewed against prior art; do not publish the new design or results before that review if filing options matter.
+
+## Implementation gate recorded on 2026-10-06
+
+The native Task 1/4 gate is `UNAVAILABLE(target_kernel_not_verified)` in this workspace. The available Docker kernel is Linux arm64; it cannot validate the planned x86_64 syscall semantics, process-incarnation tracking, or an ordered checkpoint boundary. See [the kernel feasibility note](2026-10-06-kernel-feasibility.md). The version-2 JSONL parser and pure certificate verifier are implemented as a synthetic proof model, and the CLI fails closed when native certification is requested. Tasks 4–8 remain blocked by the native gate and must not be described as implemented or measured.

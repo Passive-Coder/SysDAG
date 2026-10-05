@@ -171,8 +171,18 @@ target/release/sysdag monitor-ebpf --input /tmp/sysdag.ebpf.jsonl \
 ```
 
 Native attachment requires a BPF-capable kernel, Clang BPF toolchain, and
-`CAP_BPF` plus `CAP_PERFMON` (normally `sudo`). Run the overhead comparison
-before making low-overhead claims:
+`CAP_BPF` plus `CAP_PERFMON` (normally `sudo`).
+
+The experimental descriptor-binding certificate mode is requested with
+`collect-ebpf --loss-certification`. It currently returns an explicit
+`UNAVAILABLE(...)` error before creating an output file. The version-2 kernel
+collector and its event/checkpoint ordering have not been validated on a
+native Linux x86_64 kernel. The existing collection command above continues
+to use the version-1 relay. See
+[the feasibility gate](docs/superpowers/plans/2026-10-06-kernel-feasibility.md)
+for the required native checks.
+
+Run the overhead comparison before making low-overhead claims:
 
 ```sh
 SYSDAG_BIN=target/release/sysdag scripts/measure_capture_overhead.sh \
