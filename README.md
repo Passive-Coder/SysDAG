@@ -96,7 +96,7 @@ You should see your OS and a Docker version. If Docker is missing, you can still
 sysdag
 ```
 
-On a TTY that opens the landing. Type a path and press enter, `d` for the bundled demo, `?` for commands, `q` to quit.
+On a TTY that opens the landing. As you type a path, suggested files and directories appear below it. Suggestions include partial name matches and nearby project files. Use ↑/↓ to choose one and Tab to complete it. Press Enter to run an existing path, `d` for the bundled demo, `?` for commands, or `q` to quit.
 
 ```bash
 # sample in this repo — first run trains, second compares
@@ -127,6 +127,8 @@ Artifacts go in `.sysdag/` (baselines, traces, JSON graphs, DOT).
 | key | action |
 |---|---|
 | path + enter | run |
+| ↑ / ↓ | choose a path suggestion |
+| tab | complete the selected path |
 | `d` | clean vs decoy demo |
 | `?` | commands |
 | `q` | quit |

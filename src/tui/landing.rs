@@ -1,13 +1,16 @@
 //! Full-screen landing: decrypting wordmark, particle rain, TachyonFX spectacle.
 
 use std::io::{self, stdout};
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
@@ -37,11 +40,12 @@ const LOGO: &[&str] = &[
 const TAGLINE: &str = "process graphs  ·  WL fingerprints  ·  micro-VM tracing";
 
 const RAIN: &[char] = &[
-    '0', '1', 'ｱ', 'ﾊ', 'ﾐ', 'ﾋ', 'ｰ', 'ｳ', 'ｼ', 'ﾅ', 'ﾓ', 'ﾆ', 'ｻ', 'ﾜ', 'ﾂ', 'ｵ', 'ﾘ', 'ﾎ',
-    'ｱ', '3', '7', 'A', 'F', '░', '▒', '┊',
+    '0', '1', 'ｱ', 'ﾊ', 'ﾐ', 'ﾋ', 'ｰ', 'ｳ', 'ｼ', 'ﾅ', 'ﾓ', 'ﾆ', 'ｻ', 'ﾜ', 'ﾂ', 'ｵ', 'ﾘ', 'ﾎ', 'ｱ',
+    '3', '7', 'A', 'F', '░', '▒', '┊',
 ];
 
 const STARS: &[char] = &['·', '∙', '˙', '˚', '✶', '✦', '⠂', '⠄', '⠁', ' '];
+const MAX_SUGGESTIONS: usize = 6;
 
 #[derive(Debug, Clone)]
 pub enum LandingAction {
@@ -107,6 +111,8 @@ struct Landing {
     opened: Instant,
     frame_dt: Duration,
     input: String,
+    suggestions: Vec<String>,
+    selected_suggestion: usize,
     caret: bool,
     blink: Instant,
     item: Item,
@@ -129,6 +135,8 @@ impl Landing {
             opened: Instant::now(),
             frame_dt: Duration::from_millis(16),
             input: String::new(),
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
             caret: true,
             blink: Instant::now(),
             item: Item::Run,
@@ -228,7 +236,8 @@ impl Landing {
                     self.action = Some(LandingAction::Run { path, args });
                 } else {
                     self.flash = Some(Instant::now());
-                    self.notice = Some((Instant::now(), format!("{} does not exist", path.display())));
+                    self.notice =
+                        Some((Instant::now(), format!("{} does not exist", path.display())));
                 }
             }
         }
@@ -237,6 +246,146 @@ impl Landing {
     fn typing(&self) -> bool {
         !self.input.is_empty()
     }
+
+    fn refresh_suggestions(&mut self) {
+        self.suggestions = path_suggestions(&self.input);
+        self.selected_suggestion = 0;
+    }
+
+    fn complete_suggestion(&mut self) {
+        if let Some(path) = self.suggestions.get(self.selected_suggestion).cloned() {
+            self.input = path;
+            self.refresh_suggestions();
+        }
+    }
+
+    fn move_suggestion(&mut self, delta: i32) {
+        let n = self.suggestions.len() as i32;
+        if n > 0 {
+            self.selected_suggestion =
+                (self.selected_suggestion as i32 + delta).rem_euclid(n) as usize;
+        }
+    }
+}
+
+fn path_suggestions(input: &str) -> Vec<String> {
+    if input.is_empty() || input.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    if input == "~" {
+        return vec!["~/".into()];
+    }
+
+    let (prefix, name_prefix) = input
+        .rsplit_once('/')
+        .map(|(dir, name)| (format!("{dir}/"), name))
+        .unwrap_or_else(|| (String::new(), input));
+    let directory = if prefix.is_empty() {
+        PathBuf::from(".")
+    } else {
+        expand_home(Path::new(&prefix))
+    };
+    let mut matches = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if ignored_entry(&name, name_prefix) {
+                continue;
+            }
+            let Some(quality) = match_quality(&name, name_prefix) else {
+                continue;
+            };
+            let is_dir = entry.path().is_dir();
+            let suffix = if is_dir { "/" } else { "" };
+            matches.push((0_u8, quality, kind_rank(&entry.path(), is_dir), format!("{prefix}{name}{suffix}")));
+        }
+    }
+
+    // A bare filename can refer to a file under examples/ or tests/, so include
+    // nearby project files when the immediate directory has few useful matches.
+    if prefix.is_empty() && name_prefix.chars().count() >= 2 {
+        let mut queue = VecDeque::from([(PathBuf::from("."), 0_u8)]);
+        let mut visited = 0;
+        while let Some((dir, depth)) = queue.pop_front() {
+            if depth >= 3 || visited >= 1200 {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited >= 1200 {
+                    break;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if ignored_entry(&name, name_prefix) {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    queue.push_back((path, depth + 1));
+                } else if depth > 0 {
+                    if let Some(quality) = match_quality(&name, name_prefix) {
+                        let shown = path.strip_prefix(".").unwrap_or(&path).display().to_string();
+                        matches.push((1, quality, kind_rank(&path, false), shown));
+                    }
+                }
+            }
+        }
+    }
+
+    matches.sort_by(|a, b| (a.1, a.2, a.0, a.3.len(), &a.3).cmp(&(b.1, b.2, b.0, b.3.len(), &b.3)));
+    matches.into_iter().take(MAX_SUGGESTIONS).map(|(_, _, _, path)| path).collect()
+}
+
+fn ignored_entry(name: &str, query: &str) -> bool {
+    (name.starts_with('.') && !query.starts_with('.'))
+        || (matches!(name, "target" | "node_modules" | ".git" | ".sysdag") && query != name)
+}
+
+fn match_quality(name: &str, query: &str) -> Option<u8> {
+    if query.is_empty() || name.starts_with(query) {
+        return Some(0);
+    }
+    let name = name.to_lowercase();
+    let query = query.to_lowercase();
+    if name.starts_with(&query) {
+        Some(1)
+    } else if name.contains(&query) {
+        Some(2)
+    } else {
+        // A subsequence match gives short inputs such as "wlc" a useful
+        // workload.c recommendation.
+        let mut chars = name.chars();
+        query
+            .chars()
+            .all(|c| chars.by_ref().any(|candidate| candidate == c))
+            .then_some(3)
+    }
+}
+
+fn kind_rank(path: &Path, is_dir: bool) -> u8 {
+    if !is_dir && matches!(path.extension().and_then(|ext| ext.to_str()), Some("c" | "py" | "sh" | "strace")) {
+        0
+    } else if is_dir {
+        1
+    } else {
+        2
+    }
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix("~") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 pub fn run_landing() -> Result<LandingAction> {
@@ -304,24 +453,40 @@ fn on_key(app: &mut Landing, key: KeyEvent) {
         KeyCode::Esc => {
             if app.typing() {
                 app.input.clear();
+                app.refresh_suggestions();
             } else {
                 app.action = Some(LandingAction::Quit);
             }
         }
-        KeyCode::Char('u') if ctrl => app.input.clear(),
+        KeyCode::Char('u') if ctrl => {
+            app.input.clear();
+            app.refresh_suggestions();
+        }
         KeyCode::Enter => {
             if app.typing() {
-                app.submit_path();
+                let valid_path = parse_run_line(&app.input)
+                    .map(|(path, _)| expand_home(&path).exists())
+                    .unwrap_or(false);
+                if valid_path || app.suggestions.is_empty() {
+                    app.submit_path();
+                } else {
+                    app.complete_suggestion();
+                }
             } else {
                 app.activate();
             }
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.refresh_suggestions();
         }
         KeyCode::Delete => {
             app.input.pop();
+            app.refresh_suggestions();
         }
+        KeyCode::Down if !app.suggestions.is_empty() => app.move_suggestion(1),
+        KeyCode::Up if !app.suggestions.is_empty() => app.move_suggestion(-1),
+        KeyCode::Tab if !app.suggestions.is_empty() => app.complete_suggestion(),
         KeyCode::Down | KeyCode::Tab => app.move_sel(1),
         KeyCode::Up | KeyCode::BackTab => app.move_sel(-1),
         KeyCode::Char('?') => app.overlay = true,
@@ -336,6 +501,7 @@ fn on_key(app: &mut Landing, key: KeyEvent) {
         KeyCode::Char(c) if !ctrl => {
             if !c.is_control() {
                 app.input.push(c);
+                app.refresh_suggestions();
                 app.select(Item::Run);
             }
         }
@@ -413,8 +579,16 @@ fn draw_stage(f: &mut Frame, area: Rect, app: &Landing) {
         return;
     }
 
-    let compact = inner.height < 18 || inner.width < 52;
+    let compact = inner.height < 24 || inner.width < 52;
     let logo_h = if compact { 2 } else { LOGO.len() as u16 + 1 };
+    let suggestion_space = inner.height.saturating_sub(logo_h + 12);
+    let suggestions_h = if !app.typing() || app.input.chars().any(char::is_whitespace) {
+        0
+    } else if app.suggestions.is_empty() {
+        2.min(suggestion_space)
+    } else {
+        (app.suggestions.len() as u16 + 1).min(suggestion_space)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -423,6 +597,7 @@ fn draw_stage(f: &mut Frame, area: Rect, app: &Landing) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(3),
+            Constraint::Length(suggestions_h),
             Constraint::Min(6),
         ])
         .split(inner);
@@ -431,7 +606,8 @@ fn draw_stage(f: &mut Frame, area: Rect, app: &Landing) {
     draw_tagline(f, chunks[2], app);
     draw_sparkline(f, chunks[3], app);
     draw_path(f, chunks[4], app);
-    draw_menu(f, chunks[5], app);
+    draw_suggestions(f, chunks[5], app);
+    draw_menu(f, chunks[6], app);
 }
 
 fn draw_logo(f: &mut Frame, area: Rect, app: &Landing, compact: bool) {
@@ -581,6 +757,28 @@ fn draw_menu(f: &mut Frame, area: Rect, app: &Landing) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_suggestions(f: &mut Frame, area: Rect, app: &Landing) {
+    if area.height == 0 {
+        return;
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "  suggested paths  ↑↓ choose · tab complete",
+        fg(DIM),
+    ))];
+    if app.suggestions.is_empty() {
+        lines.push(Line::from(Span::styled("    no matching paths here", fg(MUTED))));
+    }
+    for (index, suggestion) in app.suggestions.iter().enumerate() {
+        let selected = index == app.selected_suggestion;
+        let style = if selected { bold(BLUE) } else { fg(MUTED) };
+        lines.push(Line::from(Span::styled(
+            format!("  {} {suggestion}", if selected { "▸" } else { " " }),
+            style,
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_rain(f: &mut Frame, area: Rect, app: &Landing, lane: u16) {
     f.render_widget(Block::default().style(Style::default().bg(BG)), area);
     if area.width == 0 || area.height == 0 {
@@ -599,7 +797,14 @@ fn draw_rain(f: &mut Frame, area: Rect, app: &Landing, lane: u16) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn rain_cell(app: &Landing, lane: u16, x: u16, y: u16, height: u16, t: f32) -> (char, ratatui::style::Color) {
+fn rain_cell(
+    app: &Landing,
+    lane: u16,
+    x: u16,
+    y: u16,
+    height: u16,
+    t: f32,
+) -> (char, ratatui::style::Color) {
     let seed = (lane as u64)
         .wrapping_mul(0x9E37)
         .wrapping_add(x as u64)
@@ -627,7 +832,10 @@ fn rain_cell(app: &Landing, lane: u16, x: u16, y: u16, height: u16, t: f32) -> (
         (ch, color)
     } else if seed % 23 == 0 {
         let star = STARS[((seed >> 3) as usize + (t * 2.0) as usize) % (STARS.len() - 1)];
-        (star, lerp_color(DIM, LAVENDER, 0.25 + 0.2 * (t * 1.7 + x as f32).sin()))
+        (
+            star,
+            lerp_color(DIM, LAVENDER, 0.25 + 0.2 * (t * 1.7 + x as f32).sin()),
+        )
     } else {
         (' ', BG)
     }
@@ -638,7 +846,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &Landing) {
     let hint = if app.overlay {
         "  esc close overlay"
     } else if app.typing() {
-        "  enter run   esc clear   ctrl-u wipe   ? commands"
+        "  ↑↓ choose path   tab complete   enter run/complete   esc clear"
     } else {
         "  type a path + enter   d demo   ? commands   q quit"
     };
@@ -665,17 +873,45 @@ fn draw_overlay(f: &mut Frame, area: Rect) {
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled("  this screen", bold(YELLOW))),
-        Line::from(Span::styled("  type a path + enter     run in the viewer", fg(TEXT))),
-        Line::from(Span::styled("  d                       clean vs decoy demo", fg(TEXT))),
-        Line::from(Span::styled("  ?                       this overlay", fg(TEXT))),
+        Line::from(Span::styled(
+            "  type a path + enter     run in the viewer",
+            fg(TEXT),
+        )),
+        Line::from(Span::styled(
+            "  ↑↓ choose · tab complete  select a suggested path",
+            fg(TEXT),
+        )),
+        Line::from(Span::styled(
+            "  d                       clean vs decoy demo",
+            fg(TEXT),
+        )),
+        Line::from(Span::styled(
+            "  ?                       this overlay",
+            fg(TEXT),
+        )),
         Line::from(Span::styled("  q  esc                  quit", fg(TEXT))),
         Line::from(""),
         Line::from(Span::styled("  CLI", bold(PEACH))),
-        Line::from(Span::styled("  sysdag <file> [args]    run, then the graph", fg(MUTED))),
-        Line::from(Span::styled("  sysdag train <file>     write a baseline", fg(MUTED))),
-        Line::from(Span::styled("  sysdag monitor <file>   score against it", fg(MUTED))),
-        Line::from(Span::styled("  sysdag demo / doctor    end-to-end / host check", fg(MUTED))),
-        Line::from(Span::styled("  --plain  --json         skip the app", fg(MUTED))),
+        Line::from(Span::styled(
+            "  sysdag <file> [args]    run, then the graph",
+            fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "  sysdag train <file>     write a baseline",
+            fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "  sysdag monitor <file>   score against it",
+            fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "  sysdag demo / doctor    end-to-end / host check",
+            fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "  --plain  --json         skip the app",
+            fg(MUTED),
+        )),
         Line::from(""),
         Line::from(Span::styled("  esc closes", fg(DIM))),
     ];
@@ -754,7 +990,10 @@ fn logo_band(stage: Rect) -> Rect {
 }
 
 fn spark_band(stage: Rect) -> Rect {
-    let y = stage.y.saturating_add(LOGO.len() as u16 + 3).min(stage.y.saturating_add(stage.height.saturating_sub(1)));
+    let y = stage
+        .y
+        .saturating_add(LOGO.len() as u16 + 3)
+        .min(stage.y.saturating_add(stage.height.saturating_sub(1)));
     Rect {
         x: stage.x,
         y,
@@ -774,7 +1013,7 @@ fn inset(area: Rect, x: u16, y: u16) -> Rect {
 
 pub fn parse_run_line(input: &str) -> Option<(PathBuf, Vec<String>)> {
     let mut parts = input.split_whitespace();
-    let path = PathBuf::from(parts.next()?);
+    let path = expand_home(Path::new(parts.next()?));
     let args = parts.map(str::to_string).collect();
     Some((path, args))
 }
