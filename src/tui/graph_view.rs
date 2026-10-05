@@ -15,7 +15,7 @@ use super::app::{App, FilterMode};
 use super::theme::{BLUE, DIM, GREEN, LAVENDER, MUTED, ROSE, TEAL, TEXT};
 
 const NODE_WIDTH: usize = 16;
-const ROW_SPACING: i32 = 9;
+const ROW_SPACING: i32 = 12;
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let Some(graph) = app.graph() else {
@@ -90,10 +90,25 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     };
     let positions = layout(&visible, &edges, &ids, canvas.width as usize);
     let buffer = frame.buffer_mut();
+    let mut routes: BTreeMap<(usize, &str), Vec<usize>> = BTreeMap::new();
     for edge in &edges {
-        let src = positions[ids[edge.src.as_str()]];
-        let dst = positions[ids[edge.dst.as_str()]];
-        draw_edge(buffer, canvas, app.scroll as i32, src, dst, edge);
+        routes
+            .entry((ids[edge.src.as_str()], edge.edge_type.as_str()))
+            .or_default()
+            .push(ids[edge.dst.as_str()]);
+    }
+    for ((source, edge_type), targets) in routes {
+        let mut destinations: Vec<_> = targets.into_iter().map(|index| positions[index]).collect();
+        destinations.sort_unstable();
+        destinations.dedup();
+        draw_route(
+            buffer,
+            canvas,
+            app.scroll as i32,
+            positions[source],
+            &destinations,
+            edge_type,
+        );
     }
     for (node, &(x, y)) in visible.iter().zip(positions.iter()) {
         draw_node(buffer, canvas, app.scroll as i32, x, y, node);
@@ -136,11 +151,13 @@ fn layout(
     width: usize,
 ) -> Vec<(i32, i32)> {
     let mut children = vec![Vec::new(); nodes.len()];
+    let mut parents = vec![Vec::new(); nodes.len()];
     let mut indegree = vec![0usize; nodes.len()];
     for edge in edges {
         let src = ids[edge.src.as_str()];
         let dst = ids[edge.dst.as_str()];
         children[src].push(dst);
+        parents[dst].push(src);
         indegree[dst] += 1;
     }
     let mut remaining = indegree;
@@ -170,14 +187,28 @@ fn layout(
         }
     }
     let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (index, level) in levels.into_iter().enumerate() {
+    for (index, level) in levels.iter().enumerate() {
         groups.entry(level.unwrap_or(0)).or_default().push(index);
     }
     let card_width = NODE_WIDTH.min(width.saturating_sub(2)).max(1);
     let columns = (width / (card_width + 4)).max(1);
     let mut positions = vec![(0, 0); nodes.len()];
     let mut y = 2;
-    for group in groups.values() {
+    for (level, group) in &mut groups {
+        // Place siblings near their parents, like the browser hierarchy. This
+        // keeps separate fan-outs from crossing in the common case.
+        group.sort_by_key(|&index| {
+            let parent_x: Vec<i32> = parents[index]
+                .iter()
+                .filter(|&&parent| levels[parent].unwrap_or(0) < *level)
+                .map(|&parent| positions[parent].0)
+                .collect();
+            if parent_x.is_empty() {
+                width as i32 / 2
+            } else {
+                parent_x.iter().sum::<i32>() / parent_x.len() as i32
+            }
+        });
         for row in group.chunks(columns) {
             for (slot, &index) in row.iter().enumerate() {
                 let x = ((slot + 1) * width / (row.len() + 1)) as i32;
@@ -185,61 +216,71 @@ fn layout(
             }
             y += ROW_SPACING;
         }
-        y += 2;
+        y += 4;
     }
     positions
 }
 
-fn draw_edge(
+fn draw_route(
     buffer: &mut Buffer,
     area: Rect,
     scroll: i32,
     src: (i32, i32),
-    dst: (i32, i32),
-    edge: &GraphEdge,
+    destinations: &[(i32, i32)],
+    edge_type: &str,
 ) {
-    let color = edge_color(&edge.edge_type);
-    let start = (src.0, src.1 + 4);
-    let end = (dst.0, dst.1 - 1);
-    let (mut x, mut y) = start;
-    let dx = (end.0 - x).abs();
-    let dy = -(end.1 - y).abs();
-    let step_x = if x < end.0 { 1 } else { -1 };
-    let step_y = if y < end.1 { 1 } else { -1 };
-    let mut error = dx + dy;
-    let glyph = if dx == 0 {
-        "│"
-    } else if dy == 0 {
-        "─"
-    } else if step_x == step_y {
-        "╲"
+    if destinations.is_empty() {
+        return;
+    }
+    let color = edge_color(edge_type);
+    let start_y = src.1 + 4;
+    let nearest = destinations
+        .iter()
+        .map(|(_, y)| *y)
+        .min()
+        .unwrap_or(src.1 + 12);
+    let bus_y = if nearest > start_y + 4 {
+        (start_y + nearest - 1) / 2
     } else {
-        "╱"
+        start_y + 2
     };
-    loop {
-        cell(buffer, area, scroll, x, y, glyph, color);
-        if (x, y) == end {
-            break;
+    for y in start_y..bus_y {
+        cell(buffer, area, scroll, src.0, y, "│", color);
+    }
+    let left = destinations
+        .iter()
+        .map(|(x, _)| *x)
+        .min()
+        .unwrap_or(src.0)
+        .min(src.0);
+    let right = destinations
+        .iter()
+        .map(|(x, _)| *x)
+        .max()
+        .unwrap_or(src.0)
+        .max(src.0);
+    for x in left..=right {
+        cell(buffer, area, scroll, x, bus_y, "─", color);
+    }
+    cell(buffer, area, scroll, src.0, bus_y, "┴", color);
+    for &(x, y) in destinations {
+        let end_y = y - 1;
+        if end_y > bus_y {
+            for row in bus_y + 1..end_y {
+                cell(buffer, area, scroll, x, row, "│", color);
+            }
+            cell(buffer, area, scroll, x, end_y, "▼", color);
+        } else {
+            for row in end_y + 1..bus_y {
+                cell(buffer, area, scroll, x, row, "│", color);
+            }
+            cell(buffer, area, scroll, x, end_y, "▲", color);
         }
-        let twice = error * 2;
-        if twice >= dy {
-            error += dy;
-            x += step_x;
-        }
-        if twice <= dx {
-            error += dx;
-            y += step_y;
+        if x != src.0 {
+            cell(buffer, area, scroll, x, bus_y, "┬", color);
         }
     }
-    let arrow = if dst.1 > src.1 {
-        "▼"
-    } else if dst.1 < src.1 {
-        "▲"
-    } else {
-        "▶"
-    };
-    cell(buffer, area, scroll, end.0, end.1, arrow, color);
-    let label = match edge.edge_type.as_str() {
+    let label = match edge_type {
         "FD_FLOW" => "FD",
         "PROCESS_FLOW" => "PROCESS",
         "PROC_SPAWN" => "SPAWN",
@@ -248,14 +289,13 @@ fn draw_edge(
         "SCM_RIGHTS" => "SCM",
         _ => "FLOW",
     };
-    let label_y = (start.1 + end.1) / 2;
-    if (label_y - start.1).abs() > 1 && (end.1 - label_y).abs() > 1 {
+    if bus_y - start_y > 2 {
         text(
             buffer,
             area,
             scroll,
-            (src.0 + dst.0) / 2 - label.len() as i32 / 2,
-            label_y,
+            src.0 + 2,
+            bus_y - 1,
             label,
             color,
             label.len(),
