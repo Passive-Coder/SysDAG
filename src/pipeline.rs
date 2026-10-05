@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,16 +7,15 @@ use anyhow::{bail, Context, Result};
 use crate::canonical::digest_bytes;
 use crate::config::Config;
 use crate::detector::{
-    find_baseline, load_baseline, save_baseline, score, train_baseline, BaselineManifest,
-    DecisionRecord,
+    find_baseline, load_baseline, save_baseline, score, train_baseline_with_provenance,
+    BaselineManifest, DecisionRecord,
 };
-use crate::event::TraceEvent;
+use crate::event::{ParseStats, TraceEvent};
 use crate::features::{encode, EncodedGraph};
 use crate::graph::{build_windows, validate_graph, GraphQuality, GraphRecord};
-use crate::sandbox::{
-    file_sha256, prepare_run_dir, run_in_microvm, stage_demo_world, stage_target,
-};
-use crate::tracer::{looks_like_strace, parse_strace_path};
+use crate::sandbox::{file_sha256, prepare_run_dir, run_in_microvm, stage_target};
+use crate::streaming::WindowBuilder;
+use crate::tracer::{looks_like_strace, parse_strace_path_with_privacy_map};
 use crate::visualizer::{format_decision, write_graph_artifacts};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub struct RunReport {
     pub mode: Mode,
     pub target_sha256: String,
     pub events: usize,
+    /// Aggregate capture-quality stats from parsing (Phase 1.3).
+    pub parse_stats: Option<ParseStats>,
     pub graphs: Vec<GraphRecord>,
     pub encoded: Vec<EncodedGraph>,
     pub decisions: Vec<DecisionRecord>,
@@ -83,6 +85,27 @@ pub fn classify_input(path: &Path) -> Result<InputKind> {
     Ok(InputKind::Program)
 }
 
+fn write_private_path_map(
+    run_dir: &Path,
+    map: BTreeMap<String, String>,
+    cfg: &Config,
+) -> Result<()> {
+    if cfg.privacy.is_redact_enabled() && !map.is_empty() {
+        fs::write(
+            run_dir.join("path-map.json"),
+            serde_json::to_string_pretty(&map)?,
+        )?;
+    }
+    Ok(())
+}
+type IngestResult = (
+    Vec<TraceEvent>,
+    String,
+    PathBuf,
+    GraphQuality,
+    Option<ParseStats>,
+);
+
 fn ingest(
     path: &Path,
     cfg: &Config,
@@ -90,7 +113,7 @@ fn ingest(
     run_id: &str,
     target_args: &[String],
     app_root_override: Option<&str>,
-) -> Result<(Vec<TraceEvent>, String, PathBuf, GraphQuality)> {
+) -> Result<IngestResult> {
     let mut cfg = cfg.clone();
     if let Some(root) = app_root_override {
         cfg.labels.app_root = root.to_string();
@@ -102,15 +125,25 @@ fn ingest(
             } else {
                 digest_bytes(path.to_string_lossy().as_bytes())
             };
-            let (events, stats) = parse_strace_path(path, &cfg)?;
+            let (events, stats, path_map) = parse_strace_path_with_privacy_map(path, &cfg)?;
+            let anchor_fraction = if events.is_empty() {
+                0.0
+            } else {
+                let anchored = events
+                    .iter()
+                    .filter(|e| e.enter_ns > 0 && e.exit_ns >= e.enter_ns)
+                    .count();
+                anchored as f64 / events.len() as f64
+            };
             let quality = GraphQuality {
-                capture_loss: 0,
-                unknown_calls: 0,
-                anchor_fraction: 0.0,
+                capture_loss: stats.lost_events_estimate,
+                unknown_calls: stats.unknown_syscalls,
+                anchor_fraction,
                 rejected_lines: stats.rejected,
             };
             let run_dir = prepare_run_dir(work_root, run_id)?;
-            Ok((events, sha, run_dir, quality))
+            write_private_path_map(&run_dir, path_map, &cfg)?;
+            Ok((events, sha, run_dir, quality, Some(stats)))
         }
         InputKind::EventJsonl => {
             let sha = file_sha256(path)?;
@@ -125,12 +158,11 @@ fn ingest(
                 events.push(ev);
             }
             let run_dir = prepare_run_dir(work_root, run_id)?;
-            Ok((events, sha, run_dir, GraphQuality::default()))
+            Ok((events, sha, run_dir, GraphQuality::default(), None))
         }
         InputKind::Program => {
             cfg.labels.app_root = "/guest/www".into();
             let run_dir = prepare_run_dir(work_root, run_id)?;
-            stage_demo_world(&run_dir)?;
             let (_dest, sha) = stage_target(&run_dir, path)?;
             let rel = format!(
                 "target/{}",
@@ -139,12 +171,16 @@ fn ingest(
                     .unwrap_or("program")
             );
             let sandbox = run_in_microvm(&cfg, &run_dir, &rel, target_args)?;
-            let (events, stats) = parse_strace_path(&sandbox.traces_dir, &cfg)?;
+            let (events, stats, path_map) =
+                parse_strace_path_with_privacy_map(&sandbox.traces_dir, &cfg)?;
             let quality = GraphQuality {
+                capture_loss: stats.lost_events_estimate,
+                unknown_calls: stats.unknown_syscalls,
                 rejected_lines: stats.rejected,
                 ..GraphQuality::default()
             };
-            Ok((events, sha, run_dir, quality))
+            write_private_path_map(&run_dir, path_map, &cfg)?;
+            Ok((events, sha, run_dir, quality, Some(stats)))
         }
     }
 }
@@ -168,6 +204,7 @@ fn encode_all(
     Ok(encoded)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn analyze_path(
     path: &Path,
     mode: Mode,
@@ -178,8 +215,40 @@ pub fn analyze_path(
     write_artifacts: bool,
     identity: Option<&str>,
 ) -> Result<RunReport> {
+    analyze_path_opts(
+        path,
+        mode,
+        cfg,
+        work_root,
+        baseline_dir,
+        target_args,
+        write_artifacts,
+        identity,
+        AnalyzeOpts::default(),
+    )
+}
+
+/// Extra switches for `analyze_path` (kept additive so existing callers are stable).
+#[derive(Debug, Clone, Default)]
+pub struct AnalyzeOpts {
+    /// Permit monitoring with a baseline that has hard compatibility mismatches.
+    pub allow_mismatch: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn analyze_path_opts(
+    path: &Path,
+    mode: Mode,
+    cfg: &Config,
+    work_root: &Path,
+    baseline_dir: &Path,
+    target_args: &[String],
+    write_artifacts: bool,
+    identity: Option<&str>,
+    opts: AnalyzeOpts,
+) -> Result<RunReport> {
     let run_id = new_run_id();
-    let (events, file_sha, run_dir, quality) =
+    let (events, file_sha, run_dir, quality, parse_stats) =
         ingest(path, cfg, work_root, &run_id, target_args, None)?;
     let target_sha =
         identity
@@ -216,15 +285,40 @@ pub fn analyze_path(
 
     match resolved {
         Mode::Train => {
-            let baseline = train_baseline(&encoded, &events, cfg, &target_sha, &target_sha);
+            let provenance = crate::detector::TrainingProvenance {
+                run_ids: vec![run_id.clone()],
+                total_events: events.len() as u64,
+                window_count: encoded.len() as u64,
+                input_digests: BTreeMap::from([("input".into(), file_sha.clone())]),
+                trained_with_config_sha256: cfg.digest(),
+            };
+            let baseline = train_baseline_with_provenance(
+                &encoded,
+                &events,
+                cfg,
+                &target_sha,
+                &target_sha,
+                Some(provenance),
+            );
             let path = save_baseline(baseline_dir, &baseline)?;
             if write_artifacts {
                 fs::copy(&path, run_dir.join("baseline.json"))?;
+                write_run_manifest(
+                    &run_dir,
+                    &run_id,
+                    "Train",
+                    &file_sha,
+                    cfg,
+                    &encoded,
+                    Some("baseline.json"),
+                    &["baseline.json", "events.jsonl"],
+                )?;
             }
             Ok(RunReport {
                 mode: Mode::Train,
                 target_sha256: target_sha,
                 events: events.len(),
+                parse_stats,
                 graphs: encoded.iter().map(|e| e.graph.clone()).collect(),
                 encoded,
                 decisions: vec![],
@@ -240,18 +334,46 @@ pub fn analyze_path(
                 )
             })?;
             let baseline = load_baseline(&bp)?;
-            baseline.compatibility_ok(cfg, &target_sha)?;
+            let compat = baseline.compatibility(cfg, &target_sha);
+            if !compat.compatible {
+                if !opts.allow_mismatch {
+                    bail!(
+                        "baseline is incompatible with this run: {}\
+                         \nre-train (`sysdag train`) or pass --allow-mismatch to proceed anyway",
+                        compat.mismatches.join("; ")
+                    );
+                }
+                eprintln!(
+                    "warning: proceeding with incompatible baseline: {}",
+                    compat.mismatches.join("; ")
+                );
+            }
+            for w in &compat.warnings {
+                eprintln!("note: {w}");
+            }
             let decisions: Vec<_> = encoded.iter().map(|e| score(e, &baseline, cfg)).collect();
             if write_artifacts {
                 fs::write(
                     run_dir.join("decisions.json"),
                     serde_json::to_string_pretty(&decisions)?,
                 )?;
+                let base_file = bp.file_name().and_then(|s| s.to_str()).map(str::to_string);
+                write_run_manifest(
+                    &run_dir,
+                    &run_id,
+                    "Monitor",
+                    &file_sha,
+                    cfg,
+                    &encoded,
+                    base_file.as_deref(),
+                    &["decisions.json", "events.jsonl"],
+                )?;
             }
             Ok(RunReport {
                 mode: Mode::Monitor,
                 target_sha256: target_sha,
                 events: events.len(),
+                parse_stats,
                 graphs: encoded.iter().map(|e| e.graph.clone()).collect(),
                 encoded,
                 decisions,
@@ -263,100 +385,6 @@ pub fn analyze_path(
     }
 }
 
-pub fn run_demo(cfg: &Config, work_root: &Path, json: bool) -> Result<i32> {
-    let demo_root = work_root.join("demo");
-    fs::create_dir_all(&demo_root)?;
-    let run_dir = prepare_run_dir(&demo_root, "world")?;
-    stage_demo_world(&run_dir)?;
-    let src = run_dir.join("target/workload.c");
-    let mut train_cfg = cfg.clone();
-    train_cfg.labels.app_root = "/guest/www".into();
-    // Demo programs are short; a smaller window still exercises the full pipeline.
-    if train_cfg.window.size > 32 {
-        train_cfg.window.size = 32;
-        train_cfg.window.overlap = 8;
-    }
-
-    let mut encoded_train = Vec::new();
-    let mut last_sha = String::new();
-    for (i, mode) in ["clean", "clean-alt"].iter().enumerate() {
-        let id = format!("train-{i}");
-        let rd = prepare_run_dir(&demo_root, &id)?;
-        stage_demo_world(&rd)?;
-        fs::copy(&src, rd.join("target/workload.c"))?;
-        let sb = run_in_microvm(&train_cfg, &rd, "target/workload.c", &[mode.to_string()])?;
-        last_sha = sb.target_sha256.clone();
-        let (events, stats) = parse_strace_path(&sb.traces_dir, &train_cfg)?;
-        let q = GraphQuality {
-            rejected_lines: stats.rejected,
-            ..Default::default()
-        };
-        encoded_train.extend(encode_all(&events, &train_cfg, &id, &last_sha, q)?);
-    }
-    let baseline = train_baseline(&encoded_train, &[], &train_cfg, &last_sha, &last_sha);
-    let bdir = demo_root.join("baselines");
-    let bpath = save_baseline(&bdir, &baseline)?;
-
-    let monitor = |tag: &str, arg: &str| -> Result<Vec<DecisionRecord>> {
-        let rd = prepare_run_dir(&demo_root, tag)?;
-        stage_demo_world(&rd)?;
-        fs::copy(&src, rd.join("target/workload.c"))?;
-        let sb = run_in_microvm(&train_cfg, &rd, "target/workload.c", &[arg.to_string()])?;
-        let (events, stats) = parse_strace_path(&sb.traces_dir, &train_cfg)?;
-        let q = GraphQuality {
-            rejected_lines: stats.rejected,
-            ..Default::default()
-        };
-        let enc = encode_all(&events, &train_cfg, tag, &sb.target_sha256, q)?;
-        for (i, e) in enc.iter().enumerate() {
-            write_graph_artifacts(&rd.join("graphs").join(format!("w{i:04}")), &e.graph)?;
-        }
-        Ok(enc
-            .iter()
-            .map(|e| score(e, &baseline, &train_cfg))
-            .collect())
-    };
-
-    let clean = monitor("heldout-clean", "clean")?;
-    let attack = monitor("attack-exfil", "attack")?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "baseline": bpath,
-                "clean": clean,
-                "attack": attack,
-            }))?
-        );
-    } else {
-        println!("SysCall-DAG demo");
-        println!("  baseline {}", bpath.display());
-        println!("  clean windows:");
-        for d in &clean {
-            println!("    {}  {}", d.window_id, format_decision(d));
-        }
-        println!("  attack windows:");
-        for d in &attack {
-            println!("    {}  {}", d.window_id, format_decision(d));
-        }
-        let anomalous = attack
-            .iter()
-            .any(|d| d.decision == "ANOMALOUS" || d.decision == "REVIEW");
-        if anomalous {
-            println!("\nAttack window diverged from the clean file-root baseline (decoy read + network send).");
-        } else {
-            println!("\nWarning: attack did not cross the review threshold; inspect graphs under .sysdag/demo/");
-        }
-    }
-
-    let failed_clean = clean.iter().any(|d| d.decision == "ANOMALOUS");
-    let caught = attack
-        .iter()
-        .any(|d| d.decision == "ANOMALOUS" || d.decision == "REVIEW");
-    Ok(if !failed_clean && caught { 0 } else { 2 })
-}
-
 pub fn print_report(report: &RunReport, json: bool) -> Result<i32> {
     if json {
         let v = serde_json::json!({
@@ -364,12 +392,16 @@ pub fn print_report(report: &RunReport, json: bool) -> Result<i32> {
             "target_sha256": report.target_sha256,
             "events": report.events,
             "windows": report.encoded.len(),
+            "capture_quality": capture_quality_summary(report),
             "baseline": report.baseline_path,
             "run_dir": report.run_dir,
             "decisions": report.decisions,
         });
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
+        if let Some(q) = capture_quality_summary(report) {
+            println!("capture-quality: {q}");
+        }
         match report.mode {
             Mode::Train => {
                 println!(
@@ -400,12 +432,119 @@ pub fn print_report(report: &RunReport, json: bool) -> Result<i32> {
     Ok(if anomalous { 2 } else { 0 })
 }
 
+/// One-line capture-quality summary for reports (Phase 1.3); None when no stats.
+fn capture_quality_summary(report: &RunReport) -> Option<String> {
+    let stats = report.parse_stats.as_ref()?;
+    if stats.quality_loss() == 0 {
+        return Some("clean".into());
+    }
+    let rate = if stats.lines > 0 {
+        format!(
+            " ({:.2}% of {} lines)",
+            stats.quality_loss() as f64 / stats.lines as f64 * 100.0,
+            stats.lines
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "unknown={} malformed={} lost={}{}",
+        stats.unknown_syscalls, stats.malformed_records, stats.lost_events_estimate, rate
+    ))
+}
+
 fn new_run_id() -> String {
     let ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("run-{ns}")
+}
+
+/// Write `manifest.json` into `run_dir`, checksumming every artifact present.
+/// Files in `required` that are missing cause an error; others are skipped.
+#[allow(clippy::too_many_arguments)]
+pub fn write_run_manifest(
+    run_dir: &Path,
+    run_id: &str,
+    mode_name: &str,
+    input_sha: &str,
+    cfg: &Config,
+    encoded: &[EncodedGraph],
+    baseline_file: Option<&str>,
+    required: &[&str],
+) -> Result<()> {
+    use crate::canonical::digest_bytes;
+    use crate::detector::RunManifest;
+
+    let mut checksums = BTreeMap::new();
+    for rel in ["events.jsonl", "decisions.json", "baseline.json"] {
+        let p = run_dir.join(rel);
+        if let Ok(bytes) = fs::read(&p) {
+            checksums.insert(rel.to_string(), digest_bytes(&bytes));
+        } else if required.contains(&rel) {
+            bail!("expected artifact {rel} missing from {}", run_dir.display());
+        }
+    }
+    let graphs_dir = run_dir.join("graphs");
+    if let Ok(entries) = fs::read_dir(&graphs_dir) {
+        let mut names: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        for name in names {
+            let rel = format!("graphs/{name}");
+            // Directory entries hold graph.dot / graph.json; flatten to files.
+            let p = graphs_dir.join(&name);
+            if p.is_dir() {
+                for f in ["graph.json", "graph.dot"] {
+                    let fp = p.join(f);
+                    if let Ok(bytes) = fs::read(&fp) {
+                        checksums.insert(format!("{rel}/{f}"), digest_bytes(&bytes));
+                    }
+                }
+            }
+        }
+    }
+
+    let manifest = RunManifest {
+        manifest_schema: crate::MANIFEST_SCHEMA.into(),
+        run_id: run_id.to_string(),
+        created_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        sysdag_version: crate::detector::crate_version(),
+        mode: mode_name.into(),
+        input_sha256: input_sha.into(),
+        config_sha256: cfg.digest(),
+        event_count: 0,
+        graph_digests: encoded
+            .iter()
+            .map(|e| e.graph.graph_digest_before_wl.clone())
+            .collect(),
+        baseline_file: baseline_file.map(str::to_string),
+        artifact_checksums: checksums,
+        artifact_checksum: String::new(),
+    };
+    let mut manifest = manifest;
+    manifest.event_count = match fs::read_to_string(run_dir.join("events.jsonl")) {
+        Ok(text) => text.lines().filter(|l| !l.trim().is_empty()).count() as u64,
+        Err(_) => 0,
+    };
+    manifest.artifact_checksum = manifest.checksum();
+    fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    Ok(())
+}
+
+pub fn load_run_manifest(run_dir: &Path) -> Result<crate::detector::RunManifest> {
+    let text = fs::read_to_string(run_dir.join("manifest.json"))
+        .with_context(|| format!("read manifest in {}", run_dir.display()))?;
+    serde_json::from_str(&text).with_context(|| "parse manifest.json")
 }
 
 pub fn monitor_events(
@@ -417,4 +556,22 @@ pub fn monitor_events(
     let sha = baseline.target_sha256.clone();
     let encoded = encode_all(&events, cfg, run_id, &sha, GraphQuality::default())?;
     Ok(encoded.iter().map(|e| score(e, baseline, cfg)).collect())
+}
+
+/// Incremental counterpart to `monitor_events`. Decisions are returned as each
+/// complete window closes; `evicted` feeds the existing DEGRADED_CAPTURE rule.
+pub fn monitor_event_stream<I: IntoIterator<Item = TraceEvent>>(
+    events: I,
+    cfg: &Config,
+    baseline: &BaselineManifest,
+    run_id: &str,
+    max_in_flight: usize,
+) -> Vec<DecisionRecord> {
+    let mut builder =
+        WindowBuilder::new(cfg.clone(), run_id, &baseline.target_sha256, max_in_flight);
+    events
+        .into_iter()
+        .filter_map(|e| builder.push(e))
+        .map(|g| score(&g, baseline, cfg))
+        .collect()
 }

@@ -34,6 +34,12 @@ pub struct GraphConfig {
     pub buffer_heuristic: String,
     pub external_anchors: bool,
     pub seed_stdio: bool,
+    /// `full` keeps typed edges; `node_only` removes every edge before WL.
+    pub representation: String,
+    /// `fd_only` removes buffer-flow edges; `fd_buffer` keeps both.
+    pub edge_set: String,
+    /// Multiplier applied to risk evidence that relies on heuristic buffer flow.
+    pub low_confidence_buffer_weight: f64,
 }
 
 impl Default for GraphConfig {
@@ -44,6 +50,9 @@ impl Default for GraphConfig {
             buffer_heuristic: "address_or_last_writer".into(),
             external_anchors: true,
             seed_stdio: true,
+            representation: "full".into(),
+            edge_set: "fd_buffer".into(),
+            low_confidence_buffer_weight: 0.5,
         }
     }
 }
@@ -98,6 +107,9 @@ pub struct DetectorConfig {
     pub threshold_review: f64,
     pub threshold_alert: f64,
     pub max_prototypes: usize,
+    /// Capture-quality loss rate (percent of trace lines) above which windows are
+    /// flagged DEGRADED_CAPTURE and decisions are capped at REVIEW (Phase 1.3).
+    pub max_degraded_rate_pct: f64,
 }
 
 impl Default for DetectorConfig {
@@ -110,6 +122,7 @@ impl Default for DetectorConfig {
             threshold_review: 0.35,
             threshold_alert: 0.45,
             max_prototypes: 4000,
+            max_degraded_rate_pct: 5.0,
         }
     }
 }
@@ -142,6 +155,34 @@ impl Default for SandboxConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct PrivacyConfig {
+    /// Path redaction mode: "token" (F1, F2...), "hash" (SHA-256), or "off"
+    pub redact_paths: String,
+    /// Persist raw strace lines in events (default: false)
+    pub persist_raw_lines: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            redact_paths: "token".into(),
+            persist_raw_lines: false,
+        }
+    }
+}
+
+impl PrivacyConfig {
+    pub fn is_redact_enabled(&self) -> bool {
+        self.redact_paths != "off"
+    }
+
+    pub fn use_hash(&self) -> bool {
+        self.redact_paths == "hash"
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub schema_version: String,
     pub tracer: String,
@@ -152,6 +193,7 @@ pub struct Config {
     pub wl: WlConfig,
     pub detector: DetectorConfig,
     pub sandbox: SandboxConfig,
+    pub privacy: PrivacyConfig,
     pub syscall_classes: Vec<String>,
 }
 
@@ -167,6 +209,7 @@ impl Default for Config {
             wl: WlConfig::default(),
             detector: DetectorConfig::default(),
             sandbox: SandboxConfig::default(),
+            privacy: PrivacyConfig::default(),
             syscall_classes: vec![
                 "file".into(),
                 "descriptor".into(),

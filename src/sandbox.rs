@@ -16,8 +16,6 @@ use crate::canonical::digest_bytes;
 use crate::config::Config;
 use crate::tracer::STRACE_FILTER;
 
-const WORKLOAD_C: &str = include_str!("../examples/workload.c");
-
 #[derive(Debug)]
 pub struct SandboxRun {
     pub run_dir: PathBuf,
@@ -126,14 +124,6 @@ pub fn stage_target(run_dir: &Path, source: &Path) -> Result<(PathBuf, String)> 
         .join(source.file_name().unwrap_or_default());
     fs::write(&dest, &bytes)?;
     Ok((dest, sha))
-}
-
-pub fn stage_demo_world(run_dir: &Path) -> Result<()> {
-    fs::write(run_dir.join("www/index.html"), "<html>ok</html>\n")?;
-    fs::write(run_dir.join("www/page.txt"), "static-payload\n")?;
-    fs::write(run_dir.join("decoy/secret.txt"), "harmless-decoy-token\n")?;
-    fs::write(run_dir.join("target/workload.c"), WORKLOAD_C)?;
-    Ok(())
 }
 
 pub fn run_in_microvm(
@@ -284,8 +274,4 @@ fn shell_join(args: &[String]) -> String {
 
 pub fn file_sha256(path: &Path) -> Result<String> {
     Ok(digest_bytes(&fs::read(path)?))
-}
-
-pub fn bundled_workload_c() -> &'static str {
-    WORKLOAD_C
 }

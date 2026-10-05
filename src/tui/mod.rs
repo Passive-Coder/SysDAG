@@ -13,6 +13,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 mod app;
+#[cfg(target_os = "linux")]
+mod browser;
 mod draw;
 mod landing;
 mod motion;
@@ -22,6 +24,8 @@ pub use app::Session;
 pub use landing::{run_landing, LandingAction};
 
 use app::{App, View};
+#[cfg(target_os = "linux")]
+use browser::open_graph_in_browser;
 use draw::draw;
 
 pub fn should_open(plain: bool, json: bool) -> bool {
@@ -50,10 +54,7 @@ pub fn run(session: Session) -> Result<i32> {
     Ok(app.exit_code())
 }
 
-fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     let mut last = Instant::now();
     while !app.quit {
         app.poll_analysis();
@@ -101,6 +102,9 @@ fn on_key(app: &mut App, key: KeyEvent) {
             };
             app.set_view(prev);
         }
+        KeyCode::Char('f') => {
+            app.filter = app.filter.next();
+        }
         KeyCode::Char(c) if View::from_digit(c).is_some() => {
             app.set_view(View::from_digit(c).unwrap());
         }
@@ -126,6 +130,15 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Home => app.scroll = 0,
         KeyCode::Char('[') => app.move_window(-1),
         KeyCode::Char(']') => app.move_window(1),
+        #[cfg(target_os = "linux")]
+        KeyCode::Char('v') => {
+            if let Some(graph) = app.graph().cloned() {
+                app.notice = Some(match open_graph_in_browser(&graph) {
+                    Ok(path) => (Instant::now(), format!("opened {}", path.display())),
+                    Err(err) => (Instant::now(), format!("browser failed: {err:#}")),
+                });
+            }
+        }
         _ => {}
     }
 }

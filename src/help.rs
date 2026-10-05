@@ -10,7 +10,6 @@ USAGE
   sysdag <file> [args]         run, then show the graph
   sysdag train <file>          write a clean baseline
   sysdag monitor <file>        score against a baseline
-  sysdag demo                  clean vs decoy exfil
   sysdag doctor                check docker / guest
   sysdag viz <graph.json>      print Graphviz
 
@@ -28,7 +27,6 @@ First run trains. Later runs of the same file monitor.
 
 On the landing
   type a path + enter   run
-  d                     demo
   ?                     commands
   q                     quit
 
@@ -36,5 +34,6 @@ In the viewer
   tab  1-4   overview / graph / events / inspect
   j k        move
   [ ]        window
+  v          open current graph in browser
   q          quit
 ";

@@ -1,14 +1,55 @@
 //! State-machine strace parser. A single regex is not sufficient.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::event::{CaptureInfo, EventArgs, ParseStats, ProcessRef, SyscallRef, TraceEvent};
+use crate::event::{CaptureInfo, EventArgs, Iovec, ParseStats, ProcessRef, SyscallRef, TraceEvent};
 use crate::labels::{build_labels, is_fd_allocator, is_tracked};
+
+/// Path redactor for privacy: maps real paths to stable tokens or hashes.
+#[derive(Debug, Default)]
+struct PathRedactor {
+    mapping: HashMap<String, String>,
+    counter: usize,
+}
+
+impl PathRedactor {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn redact(&mut self, path: &str, use_hash: bool) -> String {
+        if let Some(existing) = self.mapping.get(path) {
+            return existing.clone();
+        }
+        let token = if use_hash {
+            let mut hasher = Sha256::new();
+            hasher.update(path.as_bytes());
+            format!("H{:x}", hasher.finalize())[..16].to_string()
+        } else {
+            let token = format!("F{}", self.counter + 1);
+            self.counter += 1;
+            token
+        };
+        self.mapping.insert(path.to_string(), token.clone());
+        token
+    }
+
+    fn exported_mapping(&self) -> BTreeMap<String, String> {
+        // The on-disk local map is deliberately token -> plaintext.  This keeps
+        // exported event/graph artifacts usable without putting plaintext in
+        // them; callers must write it only inside the run directory.
+        self.mapping
+            .iter()
+            .map(|(plain, token)| (token.clone(), plain.clone()))
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Unfinished {
@@ -38,6 +79,60 @@ struct RawEvent {
 }
 
 pub fn parse_strace_path(path: &Path, cfg: &Config) -> Result<(Vec<TraceEvent>, ParseStats)> {
+    let (events, stats, _) = parse_strace_path_with_privacy_map(path, cfg)?;
+    Ok((events, stats))
+}
+
+/// Stateful single-line decoder for FIFO/socket strace streams.  Unlike the
+/// batch parser it preserves unfinished/resumed call state across `push` calls.
+pub struct LiveStraceParser {
+    parser: FileParser,
+    cfg: Config,
+    redactor: PathRedactor,
+    seq: u64,
+}
+
+impl LiveStraceParser {
+    pub fn new(cfg: Config) -> Self {
+        Self {
+            parser: FileParser {
+                pid_hint: None,
+                unfinished: HashMap::new(),
+                stats: ParseStats::default(),
+            },
+            cfg,
+            redactor: PathRedactor::new(),
+            seq: 0,
+        }
+    }
+
+    pub fn push(&mut self, line: &str) -> Option<TraceEvent> {
+        self.parser.stats.lines += 1;
+        let raw = self.parser.push_line(line)?;
+        let mut events = materialize(
+            vec![raw],
+            &self.cfg,
+            &mut self.parser.stats,
+            &mut self.redactor,
+        );
+        let mut event = events.pop()?;
+        self.seq += 1;
+        event.seq = self.seq;
+        Some(event)
+    }
+
+    pub fn stats(&self) -> &ParseStats {
+        &self.parser.stats
+    }
+}
+
+/// Parse a trace and return the private token-to-path map separately from the
+/// event stream.  The caller is responsible for storing this map locally only.
+pub fn parse_strace_path_with_privacy_map(
+    path: &Path,
+    cfg: &Config,
+) -> Result<(Vec<TraceEvent>, ParseStats, BTreeMap<String, String>)> {
+    let mut redactor = PathRedactor::new();
     if path.is_dir() {
         let mut files: Vec<_> = fs::read_dir(path)
             .with_context(|| format!("read trace dir {}", path.display()))?
@@ -49,19 +144,23 @@ pub fn parse_strace_path(path: &Path, cfg: &Config) -> Result<(Vec<TraceEvent>, 
         let mut all = Vec::new();
         let mut stats = ParseStats::default();
         for f in files {
-            let (ev, st) = parse_strace_file(&f, cfg)?;
+            let (ev, st) = parse_strace_file(&f, cfg, &mut redactor)?;
             merge_stats(&mut stats, &st);
             all.extend(ev);
         }
         finalize_events(&mut all);
-        return Ok((all, stats));
+        return Ok((all, stats, redactor.exported_mapping()));
     }
-    let (mut events, stats) = parse_strace_file(path, cfg)?;
+    let (mut events, stats) = parse_strace_file(path, cfg, &mut redactor)?;
     finalize_events(&mut events);
-    Ok((events, stats))
+    Ok((events, stats, redactor.exported_mapping()))
 }
 
-fn parse_strace_file(path: &Path, cfg: &Config) -> Result<(Vec<TraceEvent>, ParseStats)> {
+fn parse_strace_file(
+    path: &Path,
+    cfg: &Config,
+    path_redactor: &mut PathRedactor,
+) -> Result<(Vec<TraceEvent>, ParseStats)> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let pid_hint = pid_from_filename(path);
     let mut parser = FileParser {
@@ -76,7 +175,12 @@ fn parse_strace_file(path: &Path, cfg: &Config) -> Result<(Vec<TraceEvent>, Pars
             raw_events.push(ev);
         }
     }
-    Ok((materialize(raw_events, cfg), parser.stats))
+    // Unfinished calls that were never resumed are lost events (Phase 1.3).
+    let never_resumed: u64 = parser.unfinished.values().map(|q| q.len() as u64).sum();
+    parser.stats.lost_events_estimate += never_resumed;
+    let mut stats = parser.stats;
+    let events = materialize(raw_events, cfg, &mut stats, path_redactor);
+    Ok((events, stats))
 }
 
 fn pid_from_filename(path: &Path) -> Option<i32> {
@@ -163,20 +267,40 @@ impl FileParser {
     }
 }
 
-fn materialize(raw: Vec<RawEvent>, cfg: &Config) -> Vec<TraceEvent> {
+fn materialize(
+    raw: Vec<RawEvent>,
+    cfg: &Config,
+    stats: &mut ParseStats,
+    path_redactor: &mut PathRedactor,
+) -> Vec<TraceEvent> {
     raw.into_iter()
-        .filter(|r| is_tracked(&r.name, &cfg.syscall_classes))
+        .filter(|r| {
+            let tracked = is_tracked(&r.name, &cfg.syscall_classes);
+            if !tracked {
+                stats.unknown_syscalls += 1;
+            }
+            tracked
+        })
         .map(|r| {
+            // Redact paths in args
+            let mut args = r.args;
+            if cfg.privacy.is_redact_enabled() {
+                if let Some(path) = &args.path {
+                    args.path = Some(path_redactor.redact(path, cfg.privacy.use_hash()));
+                }
+                if let Some(fd_path) = &args.fd_path {
+                    args.fd_path = Some(path_redactor.redact(fd_path, cfg.privacy.use_hash()));
+                }
+            }
             let labels = build_labels(
                 &r.name,
-                r.args.path.as_deref().unwrap_or(""),
-                r.args.flags.as_deref().unwrap_or(""),
-                r.args.fd_path.as_deref().unwrap_or(""),
-                r.args.sock_info.as_deref().unwrap_or(""),
+                args.path.as_deref().unwrap_or(""),
+                args.flags.as_deref().unwrap_or(""),
+                args.fd_path.as_deref().unwrap_or(""),
+                args.sock_info.as_deref().unwrap_or(""),
                 r.ret,
                 r.errno.as_deref(),
-                r.args
-                    .count
+                args.count
                     .filter(|_| r.errno.is_none())
                     .or(r.ret.filter(|v| *v >= 0)),
                 &cfg.labels.app_root,
@@ -197,14 +321,18 @@ fn materialize(raw: Vec<RawEvent>, cfg: &Config) -> Vec<TraceEvent> {
                     name: r.name,
                     arch: "linux".into(),
                 },
-                r.args,
+                args,
                 r.ret,
                 r.errno,
                 labels,
                 CaptureInfo {
                     source: "strace".into(),
                     truncated: false,
-                    raw_line: r.raw,
+                    raw_line: if cfg.privacy.persist_raw_lines {
+                        r.raw
+                    } else {
+                        String::new()
+                    },
                     lost: false,
                 },
             )
@@ -232,6 +360,9 @@ fn merge_stats(dst: &mut ParseStats, src: &ParseStats) {
     dst.signals += src.signals;
     dst.exits += src.exits;
     dst.unfinished += src.unfinished;
+    dst.unknown_syscalls += src.unknown_syscalls;
+    dst.malformed_records += src.malformed_records;
+    dst.lost_events_estimate += src.lost_events_estimate;
 }
 
 fn strip_pid_prefix(line: &str) -> (Option<i32>, &str) {
@@ -305,12 +436,19 @@ fn parse_completed(body: &str) -> Option<(String, EventArgs, Option<i64>, Option
     let (args_src, tail) = split_args_and_tail(after_name)?;
     let (ret, errno) = parse_return(tail);
     let mut args = interpret_args(&name, &args_src);
-    if args.fd.is_none() && is_fd_allocator(&name) {
+    let is_dup = matches!(name.as_str(), "dup" | "dup2" | "dup3")
+        || (name == "fcntl"
+            && args
+                .flags
+                .as_deref()
+                .map(|f| f.contains("DUP"))
+                .unwrap_or(false));
+    if args.fd.is_none() && is_fd_allocator(&name) && !is_dup {
         if let Some(r) = ret.filter(|v| *v >= 0) {
             args.fd = Some(r as i32);
         }
     }
-    if name == "dup2" || name == "dup3" {
+    if is_dup {
         if let Some(r) = ret.filter(|v| *v >= 0) {
             args.newfd = Some(r as i32);
         }
@@ -428,6 +566,17 @@ fn interpret_args(name: &str, raw: &str) -> EventArgs {
                 .get(2)
                 .or(parts.last())
                 .and_then(|s| parse_int_token(s.trim_end_matches(',')));
+            if name == "recvmsg" {
+                args.received_fds = parse_scm_rights(raw);
+            }
+        }
+        "readv" | "writev" | "preadv" | "pwritev" => {
+            fill_fd(&mut args, parts.first());
+            args.iovecs = parse_iovecs(parts.get(1).map(String::as_str).unwrap_or(""));
+            if let Some(first) = args.iovecs.first() {
+                args.buffer_addr = Some(first.addr);
+                args.count = Some(first.len as i64);
+            }
         }
         "close" | "lseek" | "fstat" | "fsync" | "connect" | "bind" | "listen" | "accept"
         | "accept4" | "shutdown" => {
@@ -440,12 +589,13 @@ fn interpret_args(name: &str, raw: &str) -> EventArgs {
         }
         "fcntl" => {
             fill_fd(&mut args, parts.first());
-            if parts.get(1).map(|s| s.contains("DUP")).unwrap_or(false) {
-                args.newfd = parts.get(2).and_then(|s| parse_fd_number(s));
-            }
+            args.flags = parts.get(1).cloned();
         }
         "pipe" | "pipe2" => {
             args.pipe_fds = parse_pipe_fds(raw);
+        }
+        "clone" | "clone3" => {
+            args.flags = parts.first().cloned();
         }
         "socket" => {
             args.flags = parts.get(1).cloned();
@@ -613,6 +763,7 @@ pub fn looks_like_strace(text: &str) -> bool {
 pub const STRACE_FILTER: &str = "%file,%network,%desc,%process";
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -652,4 +803,76 @@ mod tests {
         assert_eq!(ev.ret, Some(2));
         assert_eq!(ev.args.fd, Some(3));
     }
+
+    #[test]
+    fn fcntl_dup_keeps_source_and_records_returned_fd() {
+        let (_, args, ret, errno) =
+            parse_completed("fcntl(3</tmp/source>, F_DUPFD_CLOEXEC, 10) = 10 <0.0001>").unwrap();
+        assert_eq!(ret, Some(10));
+        assert!(errno.is_none());
+        assert_eq!(args.fd, Some(3));
+        assert_eq!(args.newfd, Some(10));
+        assert!(args.flags.as_deref().unwrap_or_default().contains("DUP"));
+    }
+
+    #[test]
+    fn parses_iovecs_and_scm_rights() {
+        let (_, writev, _, _) = parse_completed("writev(4, [{iov_base=0x7fff0000, iov_len=4}, {iov_base=0x7fff0010, iov_len=8}], 2) = 12").unwrap();
+        assert_eq!(writev.iovecs.len(), 2);
+        assert_eq!(writev.iovecs[0].addr, 0x7fff0000);
+        let (_, recv, _, _) = parse_completed("recvmsg(3, {msg_control=[{cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[7, 8]}]}, 0) = 1").unwrap();
+        assert_eq!(recv.received_fds, vec![7, 8]);
+    }
+
+    #[test]
+    fn live_parser_materializes_completed_calls_in_sequence() {
+        let mut parser = LiveStraceParser::new(Config::default());
+        let first = parser
+            .push(r#"[pid 42] 1000.000001 openat(AT_FDCWD, "/tmp/input", O_RDONLY) = 3 <0.0001>"#)
+            .unwrap();
+        let second = parser
+            .push(r#"[pid 42] 1000.000002 read(3, "ok", 2) = 2 <0.0001>"#)
+            .unwrap();
+
+        assert_eq!(first.seq, 1);
+        assert_eq!(second.seq, 2);
+        assert_eq!(first.process.pid, 42);
+        assert_eq!(second.args.fd, Some(3));
+        assert_eq!(parser.stats().lines, 2);
+    }
+}
+
+fn parse_iovecs(s: &str) -> Vec<Iovec> {
+    let mut out = Vec::new();
+    for item in s.split("iov_base=").skip(1) {
+        let addr = item
+            .find("0x")
+            .and_then(|i| {
+                item[i..]
+                    .split(|c: char| !c.is_ascii_hexdigit() && c != 'x' && c != 'X')
+                    .next()
+            })
+            .and_then(parse_hex_addr);
+        let len = item
+            .split("iov_len=")
+            .nth(1)
+            .and_then(|x| x.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|x| x.parse().ok());
+        if let (Some(addr), Some(len)) = (addr, len) {
+            out.push(Iovec { addr, len });
+        }
+    }
+    out
+}
+
+fn parse_scm_rights(s: &str) -> Vec<i32> {
+    let Some(rights) = s.split("SCM_RIGHTS").nth(1) else {
+        return Vec::new();
+    };
+    let data = rights.split("cmsg_data=").nth(1).unwrap_or(rights);
+    let data = data.split(']').next().unwrap_or(data);
+    data.split(|c: char| !c.is_ascii_digit() && c != '-')
+        .filter_map(|x| x.parse::<i32>().ok())
+        .filter(|fd| *fd >= 0)
+        .collect()
 }

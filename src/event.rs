@@ -69,6 +69,18 @@ pub struct EventArgs {
     pub pipe_fds: Option<(i32, i32)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_pid: Option<i32>,
+    /// Vectored-I/O buffer addresses/lengths when strace exposes iovecs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iovecs: Vec<Iovec>,
+    /// File descriptors received through Unix-domain SCM_RIGHTS ancillary data.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub received_fds: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Iovec {
+    pub addr: u64,
+    pub len: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +101,7 @@ pub struct TraceEvent {
 }
 
 impl TraceEvent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         process: ProcessRef,
         seq: u64,
@@ -130,4 +143,29 @@ pub struct ParseStats {
     pub signals: u64,
     pub exits: u64,
     pub unfinished: u64,
+    /// Completed calls dropped because their family is not tracked (Phase 1.3).
+    #[serde(default)]
+    pub unknown_syscalls: u64,
+    /// Completed calls that parsed but carried no usable timestamp.
+    #[serde(default)]
+    pub malformed_records: u64,
+    /// Estimated lost events: rejected lines plus unfinished calls never resumed.
+    #[serde(default)]
+    pub lost_events_estimate: u64,
+}
+
+impl ParseStats {
+    /// Aggregate capture-quality signal used for the DEGRADED_CAPTURE rule.
+    pub fn quality_loss(&self) -> u64 {
+        self.unknown_syscalls + self.malformed_records + self.lost_events_estimate
+    }
+
+    /// True when loss/malformed volume exceeds a rate threshold of total lines.
+    pub fn is_degraded(&self, max_rate_pct: f64) -> bool {
+        if self.lines == 0 {
+            return false;
+        }
+        let rate = self.quality_loss() as f64 / self.lines as f64 * 100.0;
+        rate > max_rate_pct
+    }
 }

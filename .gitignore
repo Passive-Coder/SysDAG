@@ -4,3 +4,5 @@ target/
 .DS_Store
 artifacts/
 runs/
+tools/backup/
+*.bak

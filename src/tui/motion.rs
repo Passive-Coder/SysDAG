@@ -71,11 +71,9 @@ pub fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 
 pub fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     match (rgb(a), rgb(b)) {
-        (Some((ar, ag, ab)), Some((br, bg, bb))) => Color::Rgb(
-            lerp_u8(ar, br, t),
-            lerp_u8(ag, bg, t),
-            lerp_u8(ab, bb, t),
-        ),
+        (Some((ar, ag, ab)), Some((br, bg, bb))) => {
+            Color::Rgb(lerp_u8(ar, br, t), lerp_u8(ag, bg, t), lerp_u8(ab, bb, t))
+        }
         _ => {
             if t < 0.5 {
                 a
@@ -100,7 +98,7 @@ pub fn hsl(h: f32, s: f32, l: f32) -> Color {
     let a = s * l.min(1.0 - l);
     let f = |n: f32| {
         let k = (n + h * 12.0) % 12.0;
-        l - a * (k - 3.0).min(9.0 - k).min(1.0).max(-1.0)
+        l - a * (k - 3.0).min(9.0 - k).clamp(-1.0, 1.0)
     };
     Color::Rgb(
         (f(0.0) * 255.0).round() as u8,
@@ -175,10 +173,16 @@ pub fn burst_cells(seed: u64, t: f32, width: usize) -> String {
             out.push(' ');
             continue;
         }
-        let n = seed.wrapping_add(i as u64).wrapping_mul(6364136223846793005);
+        let n = seed
+            .wrapping_add(i as u64)
+            .wrapping_mul(6364136223846793005);
         let idx = ((n >> 8) as usize + (t * 19.0) as usize) % (BRAILLE.len() - 1);
         // Keep one reserved rare star; last glyph is decorative only.
-        let ch = if n % 11 == 0 { BRAILLE[BRAILLE.len() - 1] } else { BRAILLE[idx] };
+        let ch = if n.is_multiple_of(11) {
+            BRAILLE[BRAILLE.len() - 1]
+        } else {
+            BRAILLE[idx]
+        };
         out.push(ch);
     }
     out

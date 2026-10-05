@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::detector::DecisionRecord;
 use crate::event::TraceEvent;
 use crate::graph::GraphRecord;
-use crate::pipeline::{analyze_path, Mode, RunReport};
+use crate::pipeline::{analyze_path_opts, Mode, RunReport};
 
 use super::motion::{self, Spring};
 
@@ -81,6 +81,8 @@ pub struct Session {
     pub baseline_dir: PathBuf,
     pub target_args: Vec<String>,
     pub identity: Option<String>,
+    /// Monitor even when the baseline fails compatibility checks.
+    pub allow_mismatch: bool,
 }
 
 impl Session {
@@ -99,8 +101,35 @@ impl Session {
 
 pub enum Analysis {
     Pending,
-    Ready(RunReport),
+    Ready(Box<RunReport>),
     Failed(String),
+}
+
+pub enum FilterMode {
+    All,
+    NetOnly,
+    FileOnly,
+    HotOnly,
+}
+
+impl FilterMode {
+    pub fn next(&self) -> Self {
+        match self {
+            FilterMode::All => FilterMode::NetOnly,
+            FilterMode::NetOnly => FilterMode::FileOnly,
+            FilterMode::FileOnly => FilterMode::HotOnly,
+            FilterMode::HotOnly => FilterMode::All,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            FilterMode::All => "ALL",
+            FilterMode::NetOnly => "NETWORK",
+            FilterMode::FileOnly => "FILES",
+            FilterMode::HotOnly => "HOT",
+        }
+    }
 }
 
 pub struct App {
@@ -122,10 +151,12 @@ pub struct App {
     pub rows_started: Instant,
     pub burst_started: Option<Instant>,
     pub burst_seed: u64,
+    pub notice: Option<(Instant, String)>,
     pub opened: Instant,
     pub frame_dt: Duration,
     pub fx: Option<tachyonfx::Effect>,
     rx: Receiver<Result<RunReport, String>>,
+    pub filter: FilterMode,
 }
 
 impl App {
@@ -134,7 +165,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let job = session.clone();
         thread::spawn(move || {
-            let result = analyze_path(
+            let result = analyze_path_opts(
                 &job.path,
                 job.mode,
                 &job.cfg,
@@ -143,6 +174,9 @@ impl App {
                 &job.target_args,
                 true,
                 job.identity.as_deref(),
+                crate::pipeline::AnalyzeOpts {
+                    allow_mismatch: job.allow_mismatch,
+                },
             )
             .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
@@ -167,10 +201,12 @@ impl App {
             rows_started: Instant::now(),
             burst_started: None,
             burst_seed: 0,
+            notice: None,
             opened: Instant::now(),
             frame_dt: Duration::from_millis(16),
             fx: None,
             rx,
+            filter: FilterMode::All,
         };
         app.focus.set(0.0);
         if !reduced {
@@ -218,7 +254,7 @@ impl App {
         self.rows_started = Instant::now();
         self.focus.snap(1.0);
         self.focus.set(0.0);
-        self.analysis = Analysis::Ready(report);
+        self.analysis = Analysis::Ready(Box::new(report));
     }
 
     pub fn tick(&mut self, dt: Duration) {
@@ -351,14 +387,22 @@ impl App {
         if self.reduced {
             return target;
         }
-        motion::decrypt("SYSDAG", width, motion::elapsed_frac(self.brand_started, 720))
+        motion::decrypt(
+            "SYSDAG",
+            width,
+            motion::elapsed_frac(self.brand_started, 720),
+        )
     }
 
     pub fn heading_text(&self, title: &str, width: usize) -> String {
         if self.reduced {
             return motion::pad_cells(title, width);
         }
-        motion::decrypt(title, width, motion::elapsed_frac(self.heading_started, 480))
+        motion::decrypt(
+            title,
+            width,
+            motion::elapsed_frac(self.heading_started, 480),
+        )
     }
 
     pub fn exit_code(&self) -> i32 {
@@ -426,11 +470,7 @@ fn arrive_effect(report: &RunReport) -> tachyonfx::Effect {
             ),
         ]);
     }
-    if report
-        .decisions
-        .iter()
-        .any(|d| d.decision == "ANOMALOUS")
-    {
+    if report.decisions.iter().any(|d| d.decision == "ANOMALOUS") {
         return fx::sequence(&[
             coalesce,
             fx::hsl_shift_fg([14.0, 8.0, 5.0], (640, Interpolation::SineInOut)),

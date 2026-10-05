@@ -32,14 +32,35 @@ pub fn encode(graph: GraphRecord, cfg: &Config) -> EncodedGraph {
     let mut incoming: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut outgoing: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for e in &graph.edges {
+        if cfg.graph.representation == "node_only" {
+            continue;
+        }
+        if cfg.graph.edge_set == "fd_only" && e.edge_type == "BUFFER_FLOW" {
+            continue;
+        }
+        let etype = if cfg.wl.edge_typed {
+            e.edge_type.clone()
+        } else {
+            "EDGE".into()
+        };
         incoming
             .entry(e.dst.clone())
             .or_default()
-            .push((e.edge_type.clone(), e.src.clone()));
+            .push((etype.clone(), e.src.clone()));
         outgoing
             .entry(e.src.clone())
             .or_default()
-            .push((e.edge_type.clone(), e.dst.clone()));
+            .push((etype, e.dst.clone()));
+        if !cfg.wl.directed {
+            incoming
+                .entry(e.src.clone())
+                .or_default()
+                .push(("EDGE".into(), e.dst.clone()));
+            outgoing
+                .entry(e.dst.clone())
+                .or_default()
+                .push(("EDGE".into(), e.src.clone()));
+        }
     }
 
     for i in 1..=h {
@@ -165,6 +186,7 @@ mod tests {
                 dst: dst.into(),
                 edge_type: "FD_FLOW".into(),
                 resource_class: "FILE".into(),
+                confidence: 100,
             }],
             quality: GraphQuality::default(),
             graph_digest_before_wl: "x".into(),

@@ -212,6 +212,7 @@ pub fn resource_kind(name: &str, fd_path: &str, sock_info: &str) -> &'static str
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_labels(
     name: &str,
     path: &str,

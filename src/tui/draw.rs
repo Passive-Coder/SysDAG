@@ -173,6 +173,31 @@ fn draw_rail(f: &mut Frame, area: Rect, app: &App) {
             if let Some(edges) = edges {
                 lines.push(chip("edges", edges));
             }
+            if let Some(stats) = &r.parse_stats {
+                let loss = stats.quality_loss();
+                let (label, color) = if loss == 0 {
+                    ("clean".into(), GREEN)
+                } else {
+                    let rate = if stats.lines > 0 {
+                        format!(" {:.2}%", loss as f64 / stats.lines as f64 * 100.0)
+                    } else {
+                        String::new()
+                    };
+                    (
+                        format!(
+                            "degraded u={} m={} l={}{rate}",
+                            stats.unknown_syscalls,
+                            stats.malformed_records,
+                            stats.lost_events_estimate
+                        ),
+                        PEACH,
+                    )
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<8}", "capture"), fg(DIM)),
+                    Span::styled(label, fg(color)),
+                ]));
+            }
         }
         Analysis::Failed(_) => {
             lines.push(Line::from(Span::styled("  failed", fg(ROSE))));
@@ -211,7 +236,15 @@ fn draw_workspace(f: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Block::default().style(Style::default().bg(SURFACE)), area);
     let view = app.view.title();
-    let hint = format!("  {view}   tab views   1-4 jump   j/k move   [ ] window   q quit");
+    let hint = if app
+        .notice
+        .as_ref()
+        .is_some_and(|(opened, _)| opened.elapsed().as_secs() < 3)
+    {
+        format!("  {}", app.notice.as_ref().unwrap().1)
+    } else {
+        format!("  {view}   tab views   1-4 jump   j/k move   [ ] window   v browser   q quit")
+    };
     f.render_widget(Paragraph::new(Span::styled(hint, fg(DIM))), area);
 }
 
@@ -248,10 +281,7 @@ fn failed_doc(app: &App, err: &str) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(format!("  {heading}"), bold(ROSE))),
         Line::from(""),
-        Line::from(Span::styled(
-            "  the run did not produce a graph",
-            fg(MUTED),
-        )),
+        Line::from(Span::styled("  the run did not produce a graph", fg(MUTED))),
         Line::from(""),
     ];
     for part in err.lines() {
@@ -272,15 +302,16 @@ fn overview_doc(app: &App) -> Vec<Line<'static>> {
         Line::from(Span::styled(format!("  {heading}"), bold(BLUE))),
         Line::from(""),
         fade(0, app, meter, color),
-        fade(1, app, vec![Span::styled(format!("            {extra}"), fg(MUTED))], MUTED),
+        fade(
+            1,
+            app,
+            vec![Span::styled(format!("            {extra}"), fg(MUTED))],
+            MUTED,
+        ),
     ];
 
     if let Some(start) = app.burst_started {
-        let cells = burst_cells(
-            app.burst_seed,
-            start.elapsed().as_secs_f32() / 0.52,
-            24,
-        );
+        let cells = burst_cells(app.burst_seed, start.elapsed().as_secs_f32() / 0.52, 24);
         lines.push(Line::from(vec![
             Span::styled("            ", fg(DIM)),
             Span::styled(cells, fg(TEAL)),
@@ -312,7 +343,12 @@ fn overview_doc(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
 
     if let Some(d) = app.decision() {
-        lines.push(fade(3, app, vec![Span::styled("  why", bold(PEACH))], PEACH));
+        lines.push(fade(
+            3,
+            app,
+            vec![Span::styled("  why", bold(PEACH))],
+            PEACH,
+        ));
         lines.push(Line::from(""));
         if d.evidence.is_empty() {
             let note = if d.exact_known {
@@ -346,7 +382,10 @@ fn overview_doc(app: &App) -> Vec<Line<'static>> {
         lines.push(fade(
             3,
             app,
-            vec![Span::styled("  baseline written from this shape", fg(MUTED))],
+            vec![Span::styled(
+                "  baseline written from this shape",
+                fg(MUTED),
+            )],
             MUTED,
         ));
         lines.push(fade(
@@ -384,6 +423,10 @@ fn graph_doc(app: &App) -> Vec<Line<'static>> {
     let heading = app.heading_text("graph", 8);
     let mut lines = vec![
         Line::from(Span::styled(format!("  {heading}"), bold(BLUE))),
+        Line::from(Span::styled(
+            format!("  filter: {}", app.filter.label()),
+            fg(DIM),
+        )),
         Line::from(""),
     ];
     match app.graph() {
@@ -392,7 +435,7 @@ fn graph_doc(app: &App) -> Vec<Line<'static>> {
             fg(MUTED),
         ))),
         Some(g) => {
-            let tree = render_tree(g);
+            let tree = render_tree_filtered(g, &app.filter);
             for (i, line) in tree.into_iter().enumerate() {
                 lines.push(fade_line(i, app, line));
             }
@@ -488,7 +531,12 @@ fn inspect_doc(app: &App) -> Vec<Line<'static>> {
         color,
     ));
     lines.push(Line::from(""));
-    lines.push(fade(2, app, vec![Span::styled("  fields", bold(PEACH))], PEACH));
+    lines.push(fade(
+        2,
+        app,
+        vec![Span::styled("  fields", bold(PEACH))],
+        PEACH,
+    ));
     lines.push(Line::from(""));
     for (i, (k, v)) in node.label_fields.iter().enumerate() {
         lines.push(fade(
@@ -502,16 +550,8 @@ fn inspect_doc(app: &App) -> Vec<Line<'static>> {
         ));
     }
 
-    let incoming: Vec<_> = g
-        .edges
-        .iter()
-        .filter(|e| e.dst == node.id)
-        .collect();
-    let outgoing: Vec<_> = g
-        .edges
-        .iter()
-        .filter(|e| e.src == node.id)
-        .collect();
+    let incoming: Vec<_> = g.edges.iter().filter(|e| e.dst == node.id).collect();
+    let outgoing: Vec<_> = g.edges.iter().filter(|e| e.src == node.id).collect();
     lines.push(Line::from(""));
     lines.push(fade(
         12,
@@ -521,7 +561,12 @@ fn inspect_doc(app: &App) -> Vec<Line<'static>> {
     ));
     lines.push(Line::from(""));
     if incoming.is_empty() && outgoing.is_empty() {
-        lines.push(fade(13, app, vec![Span::styled("  isolated node", fg(MUTED))], MUTED));
+        lines.push(fade(
+            13,
+            app,
+            vec![Span::styled("  isolated node", fg(MUTED))],
+            MUTED,
+        ));
     }
     for (i, e) in incoming.iter().enumerate() {
         let hot = e.edge_type == "BUFFER_FLOW";
@@ -548,10 +593,7 @@ fn inspect_doc(app: &App) -> Vec<Line<'static>> {
         ));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  j/k walk nodes",
-        fg(DIM),
-    )));
+    lines.push(Line::from(Span::styled("  j/k walk nodes", fg(DIM))));
     lines
 }
 
@@ -628,10 +670,54 @@ fn fade_line(index: usize, app: &App, line: Line<'static>) -> Line<'static> {
     fade(index, app, line.spans, TEXT)
 }
 
-fn render_tree(g: &GraphRecord) -> Vec<Line<'static>> {
+fn render_tree_filtered(g: &GraphRecord, filter: &super::app::FilterMode) -> Vec<Line<'static>> {
     let mut kids: HashMap<&str, Vec<(String, &str)>> = HashMap::new();
     let mut incoming = HashMap::new();
+    // Build edges but optionally filter nodes/edges based on mode
+    let node_allowed = |id: &str| -> bool {
+        match filter {
+            super::app::FilterMode::All => true,
+            super::app::FilterMode::NetOnly => g
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| {
+                    n.label_fields
+                        .get("family")
+                        .map(|s| s == "network")
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            super::app::FilterMode::FileOnly => g
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| {
+                    n.label_fields
+                        .get("family")
+                        .map(|s| s == "file")
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            super::app::FilterMode::HotOnly => g
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| {
+                    let lab = node_label(n);
+                    lab.contains("DECOY")
+                        || lab.contains("SHELL")
+                        || lab.contains("SYSTEM_CONFIG")
+                        || lab.contains("NET_SEND")
+                })
+                .unwrap_or(false),
+        }
+    };
+
     for e in &g.edges {
+        if !node_allowed(e.src.as_str()) && !node_allowed(e.dst.as_str()) {
+            continue;
+        }
         kids.entry(e.src.as_str())
             .or_default()
             .push((e.edge_type.clone(), e.dst.as_str()));
@@ -641,10 +727,16 @@ fn render_tree(g: &GraphRecord) -> Vec<Line<'static>> {
         .nodes
         .iter()
         .map(|n| n.id.as_str())
-        .filter(|id| incoming.get(*id).copied().unwrap_or(0) == 0)
+        .filter(|id| incoming.get(*id).copied().unwrap_or(0) == 0 && node_allowed(id))
         .collect();
     if roots.is_empty() {
-        roots = g.nodes.first().map(|n| n.id.as_str()).into_iter().collect();
+        roots = g
+            .nodes
+            .iter()
+            .filter(|n| node_allowed(n.id.as_str()))
+            .map(|n| n.id.as_str())
+            .take(1)
+            .collect();
     }
     let labels: HashMap<&str, String> = g
         .nodes
@@ -772,7 +864,11 @@ fn phase_label(t: f32) -> String {
 }
 
 fn shimmer(t: f32) -> Color {
-    motion::hsl(198.0 + (t * 40.0).sin() * 14.0, 0.42, 0.62 + (t * 3.1).sin() * 0.06)
+    motion::hsl(
+        198.0 + (t * 40.0).sin() * 14.0,
+        0.42,
+        0.62 + (t * 3.1).sin() * 0.06,
+    )
 }
 
 fn inset(area: Rect, x: u16, y: u16) -> Rect {
@@ -783,4 +879,3 @@ fn inset(area: Rect, x: u16, y: u16) -> Rect {
         height: area.height.saturating_sub(y.saturating_mul(2)),
     }
 }
-
