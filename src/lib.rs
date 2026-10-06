@@ -14,6 +14,7 @@ pub mod graph;
 pub mod help;
 pub mod labels;
 pub mod pipeline;
+pub mod project;
 pub mod sandbox;
 pub mod streaming;
 pub mod tracer;

@@ -7,9 +7,9 @@ sysdag — show how a process used the kernel
 
 USAGE
   sysdag                       open the landing app (TTY)
-  sysdag <file> [args]         run, then show the graph
-  sysdag train <file>          write a clean baseline
-  sysdag monitor <file>        score against a baseline
+  sysdag <path> [args]         run, then show the graph
+  sysdag train <path>          write a clean baseline
+  sysdag monitor <path>        score against a baseline
   sysdag doctor                check docker / guest
   sysdag viz <graph.json>      print Graphviz
 
@@ -21,9 +21,10 @@ OPTIONS
   --config PATH   toml config
   --workdir DIR   artifacts (default .sysdag)
   --id NAME       baseline identity
+  --entry PATH    entrypoint within a project folder
 
-<file> is a .c / .py / .sh program, a Linux ELF, or an strace log.
-First run trains. Later runs of the same file monitor.
+<path> is a project folder, .c / .py / .sh program, Linux ELF, or strace log.
+First run trains. Later runs of the same project monitor.
 
 On the landing
   type a path + enter   run

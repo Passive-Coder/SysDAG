@@ -52,6 +52,29 @@ Enter a program or trace path and press Enter. The first run trains a baseline;
 subsequent runs monitor against that baseline. Use `--plain` for a text-only
 report or `--json` for machine-readable output.
 
+### Scan a project folder
+
+```sh
+sysdag --id my-project run /path/to/project
+sysdag --id my-project --entry src/main.py run /path/to/project
+```
+
+SysDAG stages the source tree in the Linux guest, preserving relative paths so
+local Python imports, project data files, shell scripts, and local C headers and
+source dependencies are available. It runs the selected entrypoint from the
+project root and traces the processes and files that execution actually uses.
+For a folder, it selects a conventional `main`, `app`, or `run` entrypoint; if
+there are several equally likely choices, pass `--entry` with a path relative to
+the folder. Passing one source file also stages its nearest marked project root
+(or its parent folder if no project marker exists).
+
+Generated folders such as `.git`, `target`, `node_modules`, `.venv`, and
+`.sysdag` are skipped. The staging limit is 50,000 files or 256 MiB; an
+oversized project reports an error. Dependencies supplied by packages outside
+the project must already exist in the guest image. C projects with custom build
+steps or nonstandard source-to-header naming may need a prebuilt Linux ELF as
+the entrypoint.
+
 ### Train a baseline
 
 ```sh

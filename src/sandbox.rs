@@ -5,6 +5,7 @@
 //! SYS_PTRACE, torn down after the run. That is the practical micro-VM host
 //! when Firecracker/KVM is unavailable.
 
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +15,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::canonical::digest_bytes;
 use crate::config::Config;
+use crate::project;
 use crate::tracer::STRACE_FILTER;
 
 #[derive(Debug)]
@@ -117,13 +119,36 @@ pub fn prepare_run_dir(root: &Path, run_id: &str) -> Result<PathBuf> {
 }
 
 pub fn stage_target(run_dir: &Path, source: &Path) -> Result<(PathBuf, String)> {
-    let bytes = fs::read(source).with_context(|| format!("read {}", source.display()))?;
-    let sha = digest_bytes(&bytes);
-    let dest = run_dir
-        .join("target")
-        .join(source.file_name().unwrap_or_default());
-    fs::write(&dest, &bytes)?;
-    Ok((dest, sha))
+    stage_target_with_entry(run_dir, source, None)
+}
+
+pub fn stage_target_with_entry(
+    run_dir: &Path,
+    source: &Path,
+    requested_entry: Option<&Path>,
+) -> Result<(PathBuf, String)> {
+    let root = if source.is_dir() {
+        source
+            .canonicalize()
+            .with_context(|| format!("resolve {}", source.display()))?
+    } else {
+        if requested_entry.is_some() {
+            bail!("--entry applies to a project folder, not a file");
+        }
+        project::project_root_for_file(source)?
+    };
+    let snapshot = project::snapshot(&root, Some(run_dir))?;
+    let relative = if source.is_dir() {
+        project::select_entry(&snapshot, requested_entry)?
+    } else {
+        source
+            .canonicalize()?
+            .strip_prefix(&snapshot.root)
+            .context("entrypoint is outside its project root")?
+            .to_path_buf()
+    };
+    let dest = project::stage(&snapshot, run_dir)?.join(relative);
+    Ok((dest, snapshot.digest))
 }
 
 pub fn run_in_microvm(
@@ -141,7 +166,7 @@ pub fn run_in_microvm(
     ensure_image(cfg)?;
 
     let traces = run_dir.join("traces");
-    let script = build_guest_script(guest_rel, target_args)?;
+    let script = build_guest_script(run_dir, guest_rel, target_args)?;
     fs::write(run_dir.join("work/run.sh"), script)?;
 
     let mount = run_dir
@@ -150,12 +175,14 @@ pub fn run_in_microvm(
     let image = &cfg.sandbox.image;
     let mem = format!("{}m", cfg.sandbox.memory_mb);
     let cpus = cfg.sandbox.cpus.to_string();
+    let mount_hash = digest_bytes(mount.to_string_lossy().as_bytes());
     let name = format!(
-        "sysdag-{}",
+        "sysdag-{}-{}",
         run_dir
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("run")
+            .unwrap_or("run"),
+        &mount_hash[..12]
     );
 
     let mut cmd = Command::new("docker");
@@ -206,12 +233,7 @@ pub fn run_in_microvm(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let sha = if let Some(name) = Path::new(guest_rel).file_name() {
-        let p = run_dir.join("target").join(name);
-        digest_bytes(&fs::read(p).unwrap_or_default())
-    } else {
-        digest_bytes(b"unknown")
-    };
+    let sha = digest_bytes(&fs::read(run_dir.join(guest_rel))?);
 
     Ok(SandboxRun {
         run_dir: run_dir.to_path_buf(),
@@ -221,16 +243,16 @@ pub fn run_in_microvm(
     })
 }
 
-fn build_guest_script(guest_rel: &str, target_args: &[String]) -> Result<String> {
+fn build_guest_script(run_dir: &Path, guest_rel: &str, target_args: &[String]) -> Result<String> {
     let args = shell_join(target_args);
-    let path = format!("/guest/{guest_rel}");
+    let path = sh_single(&format!("/guest/{guest_rel}"));
     let ext = Path::new(guest_rel)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("");
     let (prepare, command) = if ext == "c" {
         (
-            format!("gcc -O1 -o /guest/work/a.out {path}"),
+            c_compile_command(run_dir, guest_rel)?,
             format!("/guest/work/a.out {args}"),
         )
     } else if ext == "py" {
@@ -247,9 +269,10 @@ fn build_guest_script(guest_rel: &str, target_args: &[String]) -> Result<String>
     Ok(format!(
         r#"#!/bin/sh
 set -eu
-cd /guest
+cd /guest/target/project
 {prepare}
 export APP_ROOT=/guest/www
+export PYTHONPATH=/guest/target/project:/guest/target/project/src${{PYTHONPATH:+:$PYTHONPATH}}
 exec strace -ff -ttt -T -yy -s 256 \
   -e trace={filter} \
   -o /guest/traces/trace -- \
@@ -259,6 +282,130 @@ exec strace -ff -ttt -T -yy -s 256 \
         filter = STRACE_FILTER,
         command = command.trim(),
     ))
+}
+
+fn c_compile_command(run_dir: &Path, guest_rel: &str) -> Result<String> {
+    let root = run_dir.join("target/project");
+    let entry = Path::new(guest_rel)
+        .strip_prefix("target/project")
+        .context("C entrypoint is outside the staged project")?
+        .to_path_buf();
+    let snapshot = project::snapshot(&root, None)?;
+    let mut sources = BTreeSet::from([entry.clone()]);
+    let mut headers = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::from([entry]);
+
+    while let Some(relative) = queue.pop_front() {
+        if !visited.insert(relative.clone()) {
+            continue;
+        }
+        let text = fs::read_to_string(root.join(&relative))
+            .with_context(|| format!("read C dependency {}", relative.display()))?;
+        for line in text.lines() {
+            let line = line.trim_start();
+            let Some(rest) = line.strip_prefix("#include") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once('"') else {
+                continue;
+            };
+            let Some(header) = resolve_local_include(&snapshot, &relative, name)? else {
+                continue;
+            };
+            headers.insert(header.clone());
+            queue.push_back(header.clone());
+            if header.extension().and_then(|ext| ext.to_str()) == Some("h") {
+                let stem = header
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("");
+                let matches = snapshot
+                    .files
+                    .iter()
+                    .filter(|file| {
+                        file.relative.extension().and_then(|ext| ext.to_str()) == Some("c")
+                            && file.relative.file_stem().and_then(|part| part.to_str())
+                                == Some(stem)
+                    })
+                    .map(|file| file.relative.clone())
+                    .collect::<Vec<_>>();
+                if matches.len() == 1 {
+                    let module = matches[0].clone();
+                    if sources.insert(module.clone()) {
+                        queue.push_back(module);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut include_dirs = BTreeSet::from([PathBuf::new()]);
+    for header in headers {
+        if let Some(parent) = header.parent() {
+            include_dirs.insert(parent.to_path_buf());
+        }
+    }
+    let includes = include_dirs
+        .iter()
+        .map(|dir| {
+            let guest = Path::new("/guest/target/project").join(dir);
+            format!("-I{}", sh_single(&guest.to_string_lossy()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let source_args = sources
+        .iter()
+        .map(|source| {
+            sh_single(
+                &Path::new("/guest/target/project")
+                    .join(source)
+                    .to_string_lossy(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "gcc -O1 {includes} -o /guest/work/a.out {source_args}"
+    ))
+}
+
+fn resolve_local_include(
+    snapshot: &project::ProjectSnapshot,
+    including: &Path,
+    name: &str,
+) -> Result<Option<PathBuf>> {
+    let root = &snapshot.root;
+    let candidates = [
+        including.parent().unwrap_or(Path::new("")).join(name),
+        PathBuf::from(name),
+    ];
+    for candidate in candidates {
+        let path = root.join(&candidate);
+        if path.is_file() {
+            let canonical = path.canonicalize()?;
+            let relative = canonical
+                .strip_prefix(root)
+                .with_context(|| format!("local include {} escapes project", name))?;
+            return Ok(Some(relative.to_path_buf()));
+        }
+    }
+    let matches = snapshot
+        .files
+        .iter()
+        .filter(|file| file.relative.file_name() == Some(std::ffi::OsStr::new(name)))
+        .map(|file| file.relative.clone())
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        bail!(
+            "C include {name} matches multiple local headers; use a project-relative include path"
+        );
+    }
+    Ok(matches.into_iter().next())
 }
 
 fn sh_single(s: &str) -> String {

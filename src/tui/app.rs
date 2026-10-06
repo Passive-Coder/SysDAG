@@ -83,6 +83,8 @@ pub struct Session {
     pub identity: Option<String>,
     /// Monitor even when the baseline fails compatibility checks.
     pub allow_mismatch: bool,
+    /// Entrypoint inside a project folder when automatic selection is ambiguous.
+    pub requested_entry: Option<PathBuf>,
 }
 
 impl Session {
@@ -176,6 +178,7 @@ impl App {
                 job.identity.as_deref(),
                 crate::pipeline::AnalyzeOpts {
                     allow_mismatch: job.allow_mismatch,
+                    requested_entry: job.requested_entry.clone(),
                 },
             )
             .map_err(|e| format!("{e:#}"));

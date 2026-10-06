@@ -13,7 +13,7 @@ use crate::detector::{
 use crate::event::{ParseStats, TraceEvent};
 use crate::features::{encode, EncodedGraph};
 use crate::graph::{build_windows, validate_graph, GraphQuality, GraphRecord};
-use crate::sandbox::{file_sha256, prepare_run_dir, run_in_microvm, stage_target};
+use crate::sandbox::{file_sha256, prepare_run_dir, run_in_microvm, stage_target_with_entry};
 use crate::streaming::WindowBuilder;
 use crate::tracer::{looks_like_strace, parse_strace_path_with_privacy_map};
 use crate::visualizer::{format_decision, write_graph_artifacts};
@@ -43,11 +43,16 @@ pub enum InputKind {
     Strace,
     EventJsonl,
     Program,
+    Project,
 }
 
 pub fn classify_input(path: &Path) -> Result<InputKind> {
     if path.is_dir() {
-        return Ok(InputKind::Strace);
+        return if crate::project::contains_program(path)? {
+            Ok(InputKind::Project)
+        } else {
+            Ok(InputKind::Strace)
+        };
     }
     let ext = path
         .extension()
@@ -113,6 +118,7 @@ fn ingest(
     run_id: &str,
     target_args: &[String],
     app_root_override: Option<&str>,
+    requested_entry: Option<&Path>,
 ) -> Result<IngestResult> {
     let mut cfg = cfg.clone();
     if let Some(root) = app_root_override {
@@ -120,6 +126,9 @@ fn ingest(
     }
     match classify_input(path)? {
         InputKind::Strace => {
+            if requested_entry.is_some() {
+                bail!("--entry requires a project folder");
+            }
             let sha = if path.is_file() {
                 file_sha256(path)?
             } else {
@@ -146,6 +155,9 @@ fn ingest(
             Ok((events, sha, run_dir, quality, Some(stats)))
         }
         InputKind::EventJsonl => {
+            if requested_entry.is_some() {
+                bail!("--entry requires a project folder");
+            }
             let sha = file_sha256(path)?;
             let text = fs::read_to_string(path)?;
             let mut events = Vec::new();
@@ -160,16 +172,15 @@ fn ingest(
             let run_dir = prepare_run_dir(work_root, run_id)?;
             Ok((events, sha, run_dir, GraphQuality::default(), None))
         }
-        InputKind::Program => {
-            cfg.labels.app_root = "/guest/www".into();
+        InputKind::Program | InputKind::Project => {
+            cfg.labels.app_root = "/guest/target/project".into();
             let run_dir = prepare_run_dir(work_root, run_id)?;
-            let (_dest, sha) = stage_target(&run_dir, path)?;
-            let rel = format!(
-                "target/{}",
-                path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("program")
-            );
+            let (dest, sha) = stage_target_with_entry(&run_dir, path, requested_entry)?;
+            let rel = dest
+                .strip_prefix(&run_dir)
+                .context("staged program escaped run directory")?
+                .to_string_lossy()
+                .to_string();
             let sandbox = run_in_microvm(&cfg, &run_dir, &rel, target_args)?;
             let (events, stats, path_map) =
                 parse_strace_path_with_privacy_map(&sandbox.traces_dir, &cfg)?;
@@ -233,6 +244,8 @@ pub fn analyze_path(
 pub struct AnalyzeOpts {
     /// Permit monitoring with a baseline that has hard compatibility mismatches.
     pub allow_mismatch: bool,
+    /// Relative or absolute entrypoint for a project-folder input.
+    pub requested_entry: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -248,13 +261,20 @@ pub fn analyze_path_opts(
     opts: AnalyzeOpts,
 ) -> Result<RunReport> {
     let run_id = new_run_id();
-    let (events, file_sha, run_dir, quality, parse_stats) =
-        ingest(path, cfg, work_root, &run_id, target_args, None)?;
+    let (events, file_sha, run_dir, quality, parse_stats) = ingest(
+        path,
+        cfg,
+        work_root,
+        &run_id,
+        target_args,
+        None,
+        opts.requested_entry.as_deref(),
+    )?;
     let target_sha =
         identity
             .map(|s| s.to_string())
             .unwrap_or_else(|| match classify_input(path) {
-                Ok(InputKind::Program) => file_sha.clone(),
+                Ok(InputKind::Program | InputKind::Project) => file_sha.clone(),
                 _ => "strace-anonymous".into(),
             });
     let encoded = encode_all(&events, cfg, &run_id, &target_sha, quality)?;

@@ -53,6 +53,10 @@ struct Cli {
     /// Monitor with a baseline that fails compatibility checks (schema/pipeline/platform)
     #[arg(long, global = true)]
     allow_mismatch: bool,
+
+    /// Entrypoint relative to a project folder when automatic selection is ambiguous
+    #[arg(long, global = true)]
+    entry: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -404,6 +408,7 @@ fn real_main() -> Result<i32> {
             cli.plain,
             cli.id.as_deref(),
             cli.allow_mismatch,
+            cli.entry.as_deref(),
         ),
         Some(Command::Monitor(args)) => dispatch(
             &args.path,
@@ -416,6 +421,7 @@ fn real_main() -> Result<i32> {
             cli.plain,
             cli.id.as_deref(),
             cli.allow_mismatch,
+            cli.entry.as_deref(),
         ),
         Some(Command::Run(args)) => dispatch(
             &args.path,
@@ -428,6 +434,7 @@ fn real_main() -> Result<i32> {
             cli.plain,
             cli.id.as_deref(),
             cli.allow_mismatch,
+            cli.entry.as_deref(),
         ),
         None => {
             let Some(path) = cli.path else {
@@ -445,6 +452,7 @@ fn real_main() -> Result<i32> {
                             cli.plain,
                             cli.id.as_deref(),
                             cli.allow_mismatch,
+                            cli.entry.as_deref(),
                         ),
                     };
                 }
@@ -462,6 +470,7 @@ fn real_main() -> Result<i32> {
                 cli.plain,
                 cli.id.as_deref(),
                 cli.allow_mismatch,
+                cli.entry.as_deref(),
             )
         }
     }
@@ -479,6 +488,7 @@ fn dispatch(
     plain: bool,
     identity: Option<&str>,
     allow_mismatch: bool,
+    requested_entry: Option<&std::path::Path>,
 ) -> Result<i32> {
     if !path.exists() {
         bail!("{} does not exist", path.display());
@@ -493,6 +503,7 @@ fn dispatch(
             target_args: target_args.to_vec(),
             identity: identity.map(str::to_string),
             allow_mismatch,
+            requested_entry: requested_entry.map(PathBuf::from),
         });
     }
     let report = analyze_path_opts(
@@ -504,7 +515,22 @@ fn dispatch(
         target_args,
         true,
         identity,
-        sysdag::pipeline::AnalyzeOpts { allow_mismatch },
+        sysdag::pipeline::AnalyzeOpts {
+            allow_mismatch,
+            requested_entry: requested_entry.map(PathBuf::from),
+        },
     )?;
     print_report(&report, json)
+}
+
+#[cfg(test)]
+mod project_cli_tests {
+    use super::*;
+
+    #[test]
+    fn project_entry_can_be_selected_from_the_cli() {
+        assert!(
+            Cli::try_parse_from(["sysdag", "run", "--entry", "src/worker.py", "project",]).is_ok()
+        );
+    }
 }
