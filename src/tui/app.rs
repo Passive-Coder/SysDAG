@@ -179,6 +179,7 @@ impl App {
                 crate::pipeline::AnalyzeOpts {
                     allow_mismatch: job.allow_mismatch,
                     requested_entry: job.requested_entry.clone(),
+                    retain_capture_on_error: true,
                 },
             )
             .map_err(|e| format!("{e:#}"));
@@ -412,7 +413,11 @@ impl App {
         match &self.analysis {
             Analysis::Failed(_) => 1,
             Analysis::Ready(r) => {
-                if r.decisions.iter().any(|d| d.decision == "ANOMALOUS") {
+                if r.analysis_error.is_some() {
+                    1
+                } else if r.target_exit_code.is_some() {
+                    1
+                } else if r.decisions.iter().any(|d| d.decision == "ANOMALOUS") {
                     2
                 } else {
                     0
@@ -433,6 +438,9 @@ fn load_events(run_dir: &Path) -> Vec<TraceEvent> {
 }
 
 fn initial_score(report: &RunReport) -> (f64, bool) {
+    if report.analysis_error.is_some() {
+        return (0.0, false);
+    }
     if report.mode == Mode::Train {
         return (0.0, true);
     }

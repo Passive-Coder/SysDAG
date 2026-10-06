@@ -35,7 +35,7 @@ fn run_project(project: &Path, run: &Path) -> anyhow::Result<()> {
     let run_dir = prepare_run_dir(run, "case")?;
     let (entry, _) = stage_target(&run_dir, project)?;
     let guest_rel = entry.strip_prefix(&run_dir)?.to_string_lossy().to_string();
-    run_in_microvm(&Config::default(), &run_dir, &guest_rel, &[])?;
+    run_in_microvm(&Config::default(), &run_dir, &guest_rel, &[], false)?;
     Ok(())
 }
 

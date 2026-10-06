@@ -48,9 +48,12 @@ Open the TUI on a terminal:
 sysdag
 ```
 
-Enter a program or trace path and press Enter. The first run trains a baseline;
-subsequent runs monitor against that baseline. Use `--plain` for a text-only
-report or `--json` for machine-readable output.
+Enter a program or trace path and press Enter. Matching files and directories
+appear below the input as you type; suggestions include partial name matches
+and files in nearby project folders. Use ↑/↓ to choose a suggestion and Tab to
+complete it. The first run trains a baseline; subsequent runs monitor against
+that baseline. Use `--plain` for a text-only report or `--json` for
+machine-readable output.
 
 ### Scan a project folder
 
@@ -116,6 +119,13 @@ sysdag explain --baseline .sysdag/baselines/<name>.json \
 
 Artifacts are written below `.sysdag/`: baselines, manifests, event streams,
 graphs, decisions, and private path maps when redaction is enabled.
+
+## Terminal graph
+
+Press `2` in the TUI to see the dependency graph grouped by hierarchy level.
+Nodes use the browser viewer's file, process, network, and risk colors; typed
+arrows show every visible relationship, with buffer-flow risk edges in red.
+Press `f` to cycle graph filters and `j`/`k` to scroll.
 
 ## Browser graph visualizer
 
@@ -184,8 +194,18 @@ target/release/sysdag monitor-ebpf --input /tmp/sysdag.ebpf.jsonl \
 ```
 
 Native attachment requires a BPF-capable kernel, Clang BPF toolchain, and
-`CAP_BPF` plus `CAP_PERFMON` (normally `sudo`). Run the overhead comparison
-before making low-overhead claims:
+`CAP_BPF` plus `CAP_PERFMON` (normally `sudo`).
+
+The experimental descriptor-binding certificate mode is requested with
+`collect-ebpf --loss-certification`. It currently returns an explicit
+`UNAVAILABLE(...)` error before creating an output file. The version-2 kernel
+collector and its event/checkpoint ordering have not been validated on a
+native Linux x86_64 kernel. The existing collection command above continues
+to use the version-1 relay. See
+[the feasibility gate](docs/superpowers/plans/2026-10-06-kernel-feasibility.md)
+for the required native checks.
+
+Run the overhead comparison before making low-overhead claims:
 
 ```sh
 SYSDAG_BIN=target/release/sysdag scripts/measure_capture_overhead.sh \

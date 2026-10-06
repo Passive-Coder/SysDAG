@@ -13,6 +13,8 @@ pub mod features;
 pub mod graph;
 pub mod help;
 pub mod labels;
+pub mod loss_cert;
+pub mod loss_cert_protocol;
 pub mod pipeline;
 pub mod project;
 pub mod sandbox;

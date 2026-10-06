@@ -139,6 +139,9 @@ enum Command {
         output: PathBuf,
         #[arg(long, default_value_t = 30)]
         duration_secs: u64,
+        /// Request native descriptor-binding certificates (currently unavailable)
+        #[arg(long, default_value_t = false)]
+        loss_certification: bool,
     },
 }
 
@@ -359,7 +362,13 @@ fn real_main() -> Result<i32> {
             object,
             output,
             duration_secs,
-        }) => collect_ebpf(&object, &output, duration_secs),
+            loss_certification,
+        }) => {
+            if loss_certification {
+                sysdag::ebpf::loss_certification_available()?;
+            }
+            collect_ebpf(&object, &output, duration_secs)
+        }
         Some(Command::Verify { run_dir }) => {
             let m = sysdag::load_run_manifest(&run_dir)?;
             m.verify_against(&run_dir)?;
@@ -518,6 +527,7 @@ fn dispatch(
         sysdag::pipeline::AnalyzeOpts {
             allow_mismatch,
             requested_entry: requested_entry.map(PathBuf::from),
+            ..Default::default()
         },
     )?;
     print_report(&report, json)

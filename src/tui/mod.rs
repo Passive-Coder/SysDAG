@@ -16,6 +16,7 @@ mod app;
 #[cfg(target_os = "linux")]
 mod browser;
 mod draw;
+mod graph_view;
 mod landing;
 mod motion;
 mod theme;
@@ -104,6 +105,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('f') => {
             app.filter = app.filter.next();
+            app.scroll = 0;
         }
         KeyCode::Char(c) if View::from_digit(c).is_some() => {
             app.set_view(View::from_digit(c).unwrap());
