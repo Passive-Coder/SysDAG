@@ -1,8 +1,11 @@
 //! Full-screen landing: decrypting wordmark, particle rain, TachyonFX spectacle.
 
 use std::collections::VecDeque;
-use std::io::{self, stdout};
+use std::io::{self, stdout, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -73,7 +76,7 @@ impl Item {
 
     fn hint(self) -> &'static str {
         match self {
-            Item::Run => "type a file, then enter",
+            Item::Run => "type a file or folder, then enter",
             Item::Commands => "overlay  ·  also ?",
             Item::Quit => "leave the app",
         }
@@ -107,6 +110,8 @@ struct Landing {
     input: String,
     suggestions: Vec<String>,
     selected_suggestion: usize,
+    global_search_at: Option<Instant>,
+    global_search: Option<(String, Receiver<Vec<String>>)>,
     caret: bool,
     blink: Instant,
     item: Item,
@@ -131,6 +136,8 @@ impl Landing {
             input: String::new(),
             suggestions: Vec::new(),
             selected_suggestion: 0,
+            global_search_at: None,
+            global_search: None,
             caret: true,
             blink: Instant::now(),
             item: Item::Run,
@@ -152,6 +159,7 @@ impl Landing {
     }
 
     fn tick(&mut self, dt: Duration) {
+        self.update_global_suggestions();
         self.frame_dt = dt;
         let secs = dt.as_secs_f32();
         if self.reduced {
@@ -189,6 +197,9 @@ impl Landing {
     }
 
     fn busy(&self) -> bool {
+        if self.global_search_at.is_some() || self.global_search.is_some() {
+            return true;
+        }
         if self.reduced {
             return false;
         }
@@ -243,6 +254,51 @@ impl Landing {
     fn refresh_suggestions(&mut self) {
         self.suggestions = path_suggestions(&self.input);
         self.selected_suggestion = 0;
+        self.global_search = None;
+        self.global_search_at = global_query(&self.input).map(|_| Instant::now());
+    }
+
+    fn update_global_suggestions(&mut self) {
+        if self
+            .global_search_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_millis(150))
+        {
+            self.global_search_at = None;
+            if let Some(query) = global_query(&self.input) {
+                let (tx, rx) = mpsc::channel();
+                let input = self.input.clone();
+                thread::spawn(move || {
+                    let _ = tx.send(global_path_suggestions(&query));
+                });
+                self.global_search = Some((input, rx));
+            }
+        }
+        let result = self.global_search.as_ref().map(|(_, rx)| rx.try_recv());
+        match result {
+            Some(Ok(global)) => {
+                let (input, _) = self.global_search.take().unwrap();
+                if input == self.input {
+                    let local = std::mem::take(&mut self.suggestions);
+                    let mut merged = local.iter().take(3).cloned().collect::<Vec<_>>();
+                    for path in global.into_iter().chain(local.into_iter()) {
+                        if merged.len() >= MAX_SUGGESTIONS {
+                            break;
+                        }
+                        if !merged.contains(&path) {
+                            merged.push(path);
+                        }
+                    }
+                    self.suggestions = merged;
+                    self.selected_suggestion = self
+                        .selected_suggestion
+                        .min(self.suggestions.len().saturating_sub(1));
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.global_search = None;
+            }
+            _ => {}
+        }
     }
 
     fn complete_suggestion(&mut self) {
@@ -262,7 +318,7 @@ impl Landing {
 }
 
 fn path_suggestions(input: &str) -> Vec<String> {
-    if input.is_empty() || input.chars().any(char::is_whitespace) {
+    if input.is_empty() {
         return Vec::new();
     }
     if input == "~" {
@@ -301,16 +357,33 @@ fn path_suggestions(input: &str) -> Vec<String> {
         }
     }
 
-    // A bare filename can refer to a file under examples/ or tests/, so include
-    // nearby project files when the immediate directory has few useful matches.
+    // Include nearby files and folders, as well as common home locations.
     if prefix.is_empty() && name_prefix.chars().count() >= 2 {
         let mut queue = VecDeque::from([(PathBuf::from("."), 0_u8)]);
+        for dir in ["/Volumes", "/Applications"] {
+            let path = PathBuf::from(dir);
+            if path.is_dir() {
+                queue.push_back((path, 0));
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            for dir in [
+                home.clone(),
+                home.join("Desktop"),
+                home.join("Documents"),
+                home.join("Downloads"),
+            ] {
+                if dir.is_dir() {
+                    queue.push_back((dir, 0));
+                }
+            }
+        }
         let mut visited = 0;
         while let Some((dir, depth)) = queue.pop_front() {
             if depth >= 3 || visited >= 1200 {
                 continue;
             }
-            let Ok(entries) = std::fs::read_dir(dir) else {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
             for entry in entries.flatten() {
@@ -325,16 +398,18 @@ fn path_suggestions(input: &str) -> Vec<String> {
                     continue;
                 }
                 let path = entry.path();
-                if path.is_dir() {
-                    queue.push_back((path, depth + 1));
-                } else if depth > 0 {
+                let is_dir = path.is_dir();
+                if is_dir {
+                    queue.push_back((path.clone(), depth + 1));
+                }
+                if depth > 0 || dir != Path::new(".") {
                     if let Some(quality) = match_quality(&name, name_prefix) {
                         let shown = path
                             .strip_prefix(".")
                             .unwrap_or(&path)
                             .display()
                             .to_string();
-                        matches.push((1, quality, kind_rank(&path, false), shown));
+                        matches.push((1, quality, kind_rank(&path, is_dir), shown));
                     }
                 }
             }
@@ -347,6 +422,81 @@ fn path_suggestions(input: &str) -> Vec<String> {
         .take(MAX_SUGGESTIONS)
         .map(|(_, _, _, path)| path)
         .collect()
+}
+
+fn global_query(input: &str) -> Option<String> {
+    let query = input.trim();
+    (query.chars().count() >= 3
+        && query.len() <= 80
+        && !query.contains('/')
+        && !query.starts_with('~'))
+    .then(|| query.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn global_path_suggestions(query: &str) -> Vec<String> {
+    let Ok(mut child) = Command::new("mdfind")
+        .arg("-name")
+        .arg(query)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+    let mut ranked = Vec::new();
+    for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
+        let path = Path::new(&line);
+        if path.components().any(|part| {
+            matches!(
+                part.as_os_str().to_str(),
+                Some(".git" | ".sysdag" | ".venv" | "node_modules" | "target" | "__pycache__")
+            )
+        }) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|part| part.to_str()) else {
+            continue;
+        };
+        if ignored_entry(name, query) {
+            continue;
+        }
+        let Some(quality) = match_quality(name, query) else {
+            continue;
+        };
+        let is_dir = path.is_dir();
+        if !is_dir && !path.is_file() {
+            continue;
+        }
+        let shown = format!("{}{}", line, if is_dir { "/" } else { "" });
+        ranked.push((
+            quality,
+            kind_rank(path, is_dir),
+            path.components().count(),
+            shown,
+        ));
+        if ranked.len() >= 80 {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    ranked.sort_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
+    ranked
+        .into_iter()
+        .map(|(_, _, _, path)| path)
+        .take(MAX_SUGGESTIONS)
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn global_path_suggestions(_query: &str) -> Vec<String> {
+    Vec::new()
 }
 
 fn ignored_entry(name: &str, query: &str) -> bool {
@@ -773,7 +923,11 @@ fn draw_suggestions(f: &mut Frame, area: Rect, app: &Landing) {
     ))];
     if app.suggestions.is_empty() {
         lines.push(Line::from(Span::styled(
-            "    no matching paths here",
+            if app.global_search_at.is_some() || app.global_search.is_some() {
+                "    searching paths on this Mac…"
+            } else {
+                "    no matching paths here"
+            },
             fg(MUTED),
         )));
     }
@@ -1017,10 +1171,39 @@ fn inset(area: Rect, x: u16, y: u16) -> Rect {
 }
 
 pub fn parse_run_line(input: &str) -> Option<(PathBuf, Vec<String>)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if let Some(quote @ ('\'' | '"')) = input.chars().next() {
+        if let Some(end) = input[1..].find(quote) {
+            let path = expand_home(Path::new(&input[1..end + 1]));
+            let args = input[end + 2..]
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            return Some((path, args));
+        }
+    }
+    let whole = expand_home(Path::new(input));
+    if whole.exists() {
+        return Some((whole, Vec::new()));
+    }
+    for (index, ch) in input.char_indices().rev() {
+        if ch.is_whitespace() {
+            let candidate = expand_home(Path::new(input[..index].trim_end()));
+            if candidate.exists() {
+                let args = input[index..]
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect();
+                return Some((candidate, args));
+            }
+        }
+    }
     let mut parts = input.split_whitespace();
     let path = expand_home(Path::new(parts.next()?));
-    let args = parts.map(str::to_string).collect();
-    Some((path, args))
+    Some((path, parts.map(str::to_string).collect()))
 }
 
 #[cfg(test)]

@@ -49,11 +49,12 @@ sysdag
 ```
 
 Enter a program or trace path and press Enter. Matching files and directories
-appear below the input as you type; suggestions include partial name matches
-and files in nearby project folders. Use ↑/↓ to choose a suggestion and Tab to
-complete it. The first run trains a baseline; subsequent runs monitor against
-that baseline. Use `--plain` for a text-only report or `--json` for
-machine-readable output.
+appear below the input as you type. You can browse anywhere with absolute or
+`~` paths, including names containing spaces. Bare names search nearby folders
+and, on macOS, Spotlight-indexed locations across the computer. Use ↑/↓ to
+choose a suggestion and Tab to complete it. The first run trains a baseline;
+subsequent runs monitor against that baseline. Use `--plain` for a text-only
+report or `--json` for machine-readable output.
 
 ### Scan a project folder
 
